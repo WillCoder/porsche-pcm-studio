@@ -38,8 +38,13 @@ background-colour ring under the white dot, because `C_AMBER` and `C_DISPLAY` ar
 ## 3. Getting a layer: we are the second gf client
 
 PCM Studio does not patch the stock framebuffer: it attaches to gf as a **second client**, takes a hardware layer the stock layer manager does not use, creates
-its own 800 × 480 scanout surface and orders itself on top. **No flash partition is rewritten** — binary and font are ordinary files on `/HBpersistence`
-(`main_pcm.c:63`), and every runtime effect is RAM-only, gone on power-cycle.
+its own 800 × 480 scanout surface and orders itself on top. **Studio's own installation rewrites no flash partition** — binary and font are ordinary files on
+`/HBpersistence` (`main_pcm.c:63`), and everything Studio does to the stock software at runtime is
+RAM-only, gone on power-cycle. That is a statement about *installing and running Studio*, not about
+the project as a whole: two firmware patches have been flashed to the bench and Studio depends on
+them for anything that *changes* stock state — the IFS1 puppet cave (volume, source, tuner) and the
+IFS2 `preProcessKey` gate (stopping the stock acting on SOURCE). Both are raw-partition writes with
+real bricking risk, and neither is undone by a power cycle.
 
 **Layer numbering is inverted: `hardware layer = 7 − gf layer`** (`plat_pcm.c:438`). `devg-carmine.so` does `neg rN,r1 / add #7,r1` in three places:
 `carmine_layer_query@0x12cec`, `set_surface@0x12f86`, `set_dest_viewport@0x13124`.
@@ -58,7 +63,15 @@ layer map varies by model**, but no live census has run on a car — which is wh
 **Z-order: append yourself last.** `gf_display_set_layer_order` takes an 8-entry array, last = topmost, and it must be fully initialised (the library reads all
 8). With our gf layer appended last, a full-screen opaque surface covers the stock page: 24 000 sampled points, zero stock pixels (`plat_pcm.c:427`).
 
-**The push sequence is fixed**; `push_layer` (`plat_pcm.c:349`) and `swap_bank` (`plat_pcm.c:720`) are the only places that talk to the layer, and no shorter
+**`enable` is gated, not unconditional.** `push_layer()` returns 0 and refuses to light the layer
+while we are covering but the first frame is not yet in the surface — lighting it early shows whatever
+the stock wrote into that memory while we were yielding, which decodes as a ~198 ms green flash. The
+enable is deferred to `swap_bank()`, so the screen holds a complete stock frame until ours is ready.
+The gate lives at the single exit rather than at each call site, because there are several paths that
+light the layer and the symptom of missing one is an occasional green flicker — the hardest kind to
+reproduce or attribute. It is falsified on every boot by a deliberate fake "frame not ready".
+
+**The push sequence is otherwise fixed**; `push_layer` and `swap_bank` are the only places that talk to the layer, and no shorter
 sequence works.
 
 ```c
@@ -74,7 +87,16 @@ branch `carmine_layer_program@0x13640` packs the key as ARGB1555, always misalig
 
 **Only `disable + update` gives the layer back.** `gf_layer_attach`/`gf_layer_detach` contain zero `jsr`/PLT — the refcount is a per-process heap array,
 invisible across processes — so a killed process does **not** release the layer (enable bit measured still set) and a `slay`ed PCM Studio leaves its last frame
-on screen until power-off. Only stop it with **`touch /tmp/studio.stop`** → `plat_shutdown()` (`plat_pcm.c:485-510`).
+on screen until power-off. Only stop it with **`touch /tmp/studio.stop`** → `plat_shutdown()`, which
+disarms the touch gate, cancels MME event registration and parks the puppet cave *before* it looks at
+the layer at all — those three matter even when no layer was ever attached — then, only if there is
+one, resets blending, disables and updates it, and finally releases the single-instance lock.
+
+**Two studios at once has the same unrecoverable outcome**, by a different route: the second one's
+startup `disable + update` pulls the layer out from under the first, whose next `gf` call blocks on
+the graphics server; the survivor no longer answers `/tmp/studio.stop` and the unit needs a power
+cycle. Studio takes a lock at `/tmp/studio.lock` as its first action, and the launcher refuses to
+start over a running instance.
 
 ## 4. Alpha: one bit, on purpose
 
@@ -134,7 +156,7 @@ The shell is **dirty-driven**: nothing is redrawn unless an event, state change,
 `anim_ms()`, not "every frame" — a 47 ms redraw against a 25 ms tick would saturate the CPU; the BT page returns 80 ms playing, 0 paused, 50 ms during a press
 glow (`scene_btplay.c:812`). Scenes also declare a **dirty rectangle** via `anim_rect()`; the shell sets the gfx clip and runs *the same* render function
 (`pcm_shell.c:234`), so partial and full redraws cannot diverge, and every primitive intersects its bounding box with the clip (`gfx.c:24`). Rect sizes are
-**derived** from the layout constants (`scene_btplay.c:846-862`): narrow (only the vinyl disc turns) = (109,153)–(283,327), 174 × 174 = 30 276 px = **7.9 %** of
+**derived** from the layout constants (`btplay_anim_rect()`): narrow (only the vinyl disc turns) = (109,153)–(283,327), 174 × 174 = 30 276 px = **7.9 %** of
 the page; wide (the second also ticked, so progress bar and time row too) = (109,153)–(766,352), 657 × 199 = 130 743 px = **34.0 %**. At 80 ms that is ~12.5
 redraws/s, one of which takes the wide rect; the press glow is in neither rect, so `anim_rect` returns 0 during a press and the shell goes full-page. The
 **background is cached** by its 13 parameters and memcpy'd per frame (`gfx.c:152-157`); on a partial redraw only the clipped rows **and columns** are restored —
@@ -193,7 +215,10 @@ touch early-return in stock's firmware (`plat_pcm.c:1691-1703`):
 0x085D1EAA:  S = *(q+0x28);  return (*(S+0x1a0) == 2) ? *(S+0x9c) : 0
 ```
 
-Writing `*(S+0x9c) = 1` makes stock drop touch frames; hard keys are unaffected (different path). The gate is `xor #1`, not a logical negate — **only odd values
+Writing `*(S+0x9c) = 1` makes stock drop touch frames. Hard keys take a different path and this word
+alone does not touch them — which is why blocking a key needs its own firmware patch; on a unit with
+the IFS2 gate flashed, arming this same word *also* makes the stock drop SOURCE, because the cave
+re-tests the stock's own predicate rather than keeping separate state. The gate is `xor #1`, not a logical negate — **only odd values
 work; write 1**. It needs **both** `*(S+0x9c)==1` **and** `*(S+0x1a0)==2`, so reading back `0x9c == 1` alone is a false green; a per-tick watchdog re-checks
 `0x1a0` and writes it back to 2 (`plat_pcm.c:1860-1884`). **Effectiveness is not settled**: on the bench the settings page (id 3475) held, the BT page (id 375)
 failed once and then held for 8 presses after the watchdog, with no evidence either way about the watchdog's role. The only admissible test is to press where
@@ -224,7 +249,7 @@ Glyphs are baked offline to an anti-aliased coverage bitmap (`tools/bake_font.py
 to 2.5 (`gfx.c:501-509`). **Scaling is 1/16 fixed point**, not integer multiples (`gfx.c:634`): bilinear plus edge reconstruction, since pixel replication gives
 2×2 stair-steps that read as blurry.
 
-**Character coverage is a real, user-visible limit** — track titles are arbitrary text from the phone. The recipe of record (`tools/bake_font.py:167-180`) bakes
+**Character coverage is a real, user-visible limit** — track titles are arbitrary text from the phone. The recipe of record (`tools/bake_font.py`, the `--charset` handling) bakes
 `--charset gb2312` = GB2312 levels 1+2, **6763 hanzi / 6875 glyphs**, ~3.76 MB. Level 1 only (3755) was rejected because real track titles need level-2
 characters; the full CJK set (12792 glyphs, 7.3 MB) does not fit on the bench, and `bake_font.py` offers no Big5 charset ⇒ **traditional-only characters outside
 GB2312 render as placeholder boxes.** The loader tries three candidate paths and validates each by *content*, not by `open()` succeeding (`main_pcm.c:56-95`).

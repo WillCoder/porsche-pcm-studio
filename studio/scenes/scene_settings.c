@@ -26,7 +26,6 @@
 #define T_BG0   11,14,20
 #define T_BG1   23,29,41
 #define T_ROW   27,34,48
-#define T_ROW_SEL 38,50,72
 #define T_INK   243,245,249
 #define T_INK2  154,163,178
 #define T_INK3  97,106,121
@@ -39,19 +38,26 @@
  * 🚨 原来是两行(名字 + 状态各一行), 两个 24px 行塞进 64px 行高**怎么调都局促**,
  *   英文下"Studio"直接顶到框底。改成一行之后行高反而能降, 视觉也干净。 */
 #define ROW_H   60
-#define ROW_Y0  128
+#define ROW_Y0  100
 #define ROW_GAP 12
 #define ROW_SW_X (ROW_X + ROW_W - 80)      /* 开关左边 */
 #define ROW_ST_R (ROW_X + ROW_W - 96)      /* 状态文字的右边界 */
 #define HINT_Y  (ROW_Y0 + NROW*(ROW_H+ROW_GAP) + 12)
 #define NROW    4              /* 三个接管开关 + 语言 */
 
-/* 返回入口(左上角)。命中区 88×88。 */
-#define BACK_CX 44
-#define BACK_CY 56
-#define BACK_HIT 44
+/* 返回入口(左上角)。
+ * 🚨 命中区原来是 88×88(半边 44), 一直顶到 x=88, 而标题从 x=92 起 —— 只差 4px。
+ *   2026-08-14 用户想点第一行, 两下都落在标题那一带, 其中一下直接被返回键吃掉、退出了设置页,
+ *   而且从现象上看就是"点了没反应"(其实是换页了)。电阻屏本来就难按, 再挨这么近就是设计问题。
+ *   ⇒ 缩到 72×72, 并把标题往右让 8px, 中间留出可见的空隙。 */
+#define BACK_CX (SB_L + 3)
+#define BACK_CY SB_ICY
+#define BACK_HIT 26
 
-static int g_set_sel = 0;
+/* 🚫 没有"选中项"(用户 2026-08-14 定): 不做旋钮选中, 只做触摸。
+ *   但**提示行**还得有个"说的是哪一项" —— 现在改成跟着**最后点过**的那一行走,
+ *   而不是一个常驻的光标。开机默认第 0 行。 */
+static int g_set_hint = 0;
 
 /* 🚨 存**文案 id 不是字符串**: 表是 static const, 用 T() 初始化编不过,
  *   而且会把语言冻在启动那一刻(换了语言这几行还是老语言)。画的时候再查。 */
@@ -109,26 +115,20 @@ static void settings_render(u16_ *fb, const PcmState *st, unsigned t_ms){
     /* 五个场景共用同一个背景 —— 切页只重画前景, 搬运量掉到约 1/5。 */
     gfx_backdrop(T_BG0, T_BG1, 180, 140, 330, 58,120,190, 0);
 
+    /* 🎨 所有页面统一成一个结构: [返回] 页名 ……… [音量] [时钟] [齿轮]
+     *   设置页原来还留着 48px 的大标题 + 单独摆的返回箭头, 和音源页(页名已在状态栏里)不一致,
+     *   而且返回箭头正好压在状态栏那一行上。2026-08-14 用户: "左右上下都不对齐"。
+     *   ⇒ 页名进状态栏左槽, 返回箭头排在它前面, 副标题挪到分隔线下面。 */
+    shell_statusbar(st, SB_R, T_INK2);
     back_arrow(BACK_CX, BACK_CY, T_INK2);
-    /* ⚠️ 行距按**英文**留, 不是按中文。拉丁字母有升部降部(Settings 的 g),
-     *   实际占的高度比同号中文大一截 —— 中文下看着刚好的间距, 英文下就是压在一起。
-     *   这一条是加英文那天在 Mac 预览上当场看见的, 别再按中文调回去。 */
-    gfx_text(ROW_X + 36, 26, T(STR_SETTINGS), 2, T_INK);
-    gfx_text(ROW_X + 36, 88, T(STR_SET_SUB), 1, T_INK3);
+    sb_text(SB_L + 26, T(STR_SETTINGS), T_INK);
+    gfx_text(SB_L, SB_H + 8, T(STR_SET_SUB), 1, T_INK3);
 
     for(i=0;i<NROW;i++){
         int y = ROW_Y0 + i*(ROW_H+ROW_GAP);
-        int sel = (i == g_set_sel);
         int on  = plat_cfg_get(SET_ROWS[i].cfg);      /* 现查, 不缓存 */
-        if(sel){
-            gfx_rrect(ROW_X, y, ROW_W, ROW_H, 16, T_ROW_SEL);
-            gfx_rrect_ring(ROW_X, y, ROW_W, ROW_H, 16, T_AMBER, 200);
-        } else {
-            gfx_rrect(ROW_X, y, ROW_W, ROW_H, 16, T_ROW);
-        }
-        /* ⚠️ 颜色宏是三个分量, 绝不能进三元(构建期 lint 也拦) */
-        if(sel) gfx_text(ROW_X+22, y+18, T(SET_ROWS[i].name), 1, T_INK);
-        else    gfx_text(ROW_X+22, y+18, T(SET_ROWS[i].name), 1, T_INK2);
+        gfx_rrect(ROW_X, y, ROW_W, ROW_H, 16, T_ROW);
+        gfx_text(ROW_X+22, y+18, T(SET_ROWS[i].name), 1, T_INK);
         if(SET_ROWS[i].kind == RK_LANG){
             /* 语言行不画开关, 画"现在是哪种语言"。名字用**该语言自己的写法** ——
              * 界面一旦变成看不懂的语言, 用户就是靠这一行认回来的。 */
@@ -143,7 +143,7 @@ static void settings_render(u16_ *fb, const PcmState *st, unsigned t_ms){
             set_switch(ROW_SW_X, y+(ROW_H-30)/2, on);
         }
     }
-    gfx_text(ROW_X, HINT_Y, T(SET_ROWS[g_set_sel].hint), 1, T_INK3);
+    gfx_text(ROW_X, HINT_Y, T(SET_ROWS[g_set_hint].hint), 1, T_INK3);
 
     /* 右列: 只读的原厂真实状态 —— 既是"关于", 也是状态镜像的活体验证窗口。
      * 你在原厂那边切一下源/换一下页, 这里的数字会立刻跟着变。 */
@@ -182,21 +182,13 @@ static int set_row_hit(int x, int y){
  * 但写成 (v+1)%LANG_N —— 加第三种语言时这里不用再改一次)。两种都当场落盘。 */
 static void set_toggle(int i){
     int v = plat_cfg_get(SET_ROWS[i].cfg);
-    g_set_sel = i;
+    g_set_hint = i;                       /* 提示行跟着最后点过的走 */
     if(SET_ROWS[i].kind == RK_LANG) plat_cfg_set(SET_ROWS[i].cfg, (v + 1) % LANG_N);
     else                            plat_cfg_set(SET_ROWS[i].cfg, !v);
 }
 
 static int settings_event(const PcmEvent *ev, const PcmState *st){
-    if(ev->type == EV_ROTARY && ev->which == KNOB_TUNE){
-        g_set_sel = (g_set_sel + ev->arg + NROW) % NROW;
-        return 1;
-    }
-    if(ev->type == EV_KEY_DOWN){
-        if(ev->arg == K_UP)   { g_set_sel = (g_set_sel+NROW-1)%NROW; return 1; }
-        if(ev->arg == K_DOWN) { g_set_sel = (g_set_sel+1)%NROW; return 1; }
-        if(ev->arg == K_OK)   { set_toggle(g_set_sel); return 1; }
-    }
+    /* 🚫 不处理旋钮/方向键/OK —— 只认触摸。 */
     if(ev->type == EV_TOUCH_DOWN){
         int i;
         if(ev->x >= BACK_CX-BACK_HIT && ev->x < BACK_CX+BACK_HIT &&
@@ -217,6 +209,10 @@ static void settings_enter(void){
         if(set_row_hit(ROW_X + ROW_W/2, cy) != i) bad = 1;
     }
     if(set_row_hit(BACK_CX, BACK_CY) >= 0) bad = 1;
+    /* 返回键命中区不许摸到页名的起始 x —— 这条就是那次误触的直接判据 */
+    if(BACK_CX + BACK_HIT >= SB_L + 26) bad = 1;
+    /* 第一行不许压到状态栏 */
+    if(ROW_Y0 < SB_H) bad = 1;
     /* 🚨 加一行就可能掉出屏幕 —— 加语言那行的时候真掉了(最后一行到 456, 提示行到 484 > 480),
      *   而屏外的内容**在预览图上也看不见**, 只会表现成"那一项点不到"。所以由自检兜住。 */
     if(ROW_Y0 + (NROW-1)*(ROW_H+ROW_GAP) + ROW_H > SCR_H) bad = 1;

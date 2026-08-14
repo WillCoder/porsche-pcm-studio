@@ -12,7 +12,13 @@ it cannot, and why not. The "why not" matters because the reasons are not interc
 
 Evidence strength is marked as **measured** (run on a bench unit), **read out of the
 firmware** (static analysis of the stock binaries), or **inferred** (never executed).
-`file:line` references point into `studio/` in this repository.
+
+⚠️ **On `file:line` references.** They point into `studio/` in this repository, but they are a
+*snapshot*: `plat_pcm.c` alone is over 3000 lines and changes most days, so a line number can drift
+by hundreds of lines between edits of this document. **When a citation and a symbol name disagree,
+the symbol name is the authoritative one** — grep for it. Newer passages cite symbols precisely
+because those do not rot. A sync-time check rejects citations that point past the end of a file, but
+nothing can mechanically catch a number that is merely stale.
 
 ---
 
@@ -62,6 +68,16 @@ enum { CMD_PLAY=1, CMD_PAUSE, CMD_NEXT, CMD_PREV, CMD_SET_VOLUME, CMD_SET_SOURCE
 `CMD_SEEK` is deliberately absent (see `CAP_SEEK`). A comment-guarded constant is not enough:
 as long as the constant exists, someone wires a draggable progress bar to it.
 
+**A second, stronger rule sits in front of the whole enum: if Studio is not visibly covering the
+screen, no event is delivered to a scene and no command is sent at all.** `cover_owns_input()`
+(`plat_pcm.c:2901`) gates both chokepoints — `plat_poll_event()` drops every touch (`:2919`) and
+`plat_command()` refuses outright (`:3311-3319`). It is enforced at those two places rather than
+per scene because the failure it prevents is *invisible*: in mirror mode a scene that was not on
+screen interpreted a real touch with its own layout and drove `CMD_SET_SOURCE` through the puppet
+cave, actually switching the car's audio source. The SOURCE hard key is the one deliberate
+exemption, because it is a key **code** rather than a coordinate and it is the only way back once
+we have yielded the screen — and it only navigates; it never reaches `plat_command()`.
+
 ### 2.1 Backend per command
 
 | Command | Transport | Primitive | Needs flashed firmware? |
@@ -70,13 +86,14 @@ as long as the constant exists, someone wires a draggable progress bar to it.
 | `CMD_NEXT` / `CMD_PREV` | MME | `mme_button` subtype 18, body `MMB_NEXT=0` / `MMB_PREV=1` (`plat_pcm.c:2458-2459`, `:2675-2682`) | No |
 | `CMD_SET_SHUFFLE` / `CMD_SET_REPEAT` | MME | subtype 12 / 13, clamped to 0..4 (`plat_pcm.c:2695-2701`) | No |
 | `CMD_SET_VOLUME` | puppet cave | `pup_arm_op(PUP_OP_VOL_UP/DOWN, …)` (`plat_pcm.c:2715-2722`) | **Yes** |
-| `CMD_SET_SOURCE` | puppet cave | `PUP_OP_ENTERT_SOURCE_CHANGED`, arg = stock slot id (`plat_pcm.c:2723-2725`) | **Yes** |
+| `CMD_SET_SOURCE` | puppet cave | `PUP_OP_ENTERT_SOURCE_CHANGED`; arg is a Studio-side `SRC_*`, **not** a stock slot — `src_to_slot()` in the platform layer maps it and rejects unknown values | **Yes** |
 | `CMD_TUNE` | puppet cave | `PUP_OP_TUNER_FREQUENCY`, arg = kHz (`plat_pcm.c:2726-2728`) | **Yes** |
 
 The puppet-cave path arms a stub at fixed addresses inside a flashed image; those addresses
 come from a generated header, `platform/puppet_addr.h`, emitted by the flash packager so the
-binary and the flashed cave cannot disagree (`plat_pcm.c:48`). **That header is not in this
-repository.** The media transport controls need none of it: they are a second client on
+binary and the flashed cave cannot disagree (`plat_pcm.c:48`). **The header is published** (the
+build needs it) **but the cave it describes is not** — the packager that produces both lives in an
+unpublished workspace, and the addresses are valid for exactly one firmware build on one unit. The media transport controls need none of it: they are a second client on
 `/dev/mme/default` alongside the stock HMI. Measured — `GETCLIENTCOUNT` returned 8 with the
 stock processes unharmed.
 
@@ -177,7 +194,8 @@ track's audio* is not (§6).
 
 ### 4.1 Layer, format, cost
 
-* Independent gf hardware layer, full 800×480, over the stock UI. Zero flash: layer claim,
+* Independent gf hardware layer, full 800×480, over the stock UI. **The overlay itself needs no
+  flash** (it is the commands in §2.1 that do): layer claim,
   pixel writes and layer order are all runtime, and a power cycle restores stock state
   (`plat_pcm.c:6-16`).
 * gf1 (hardware L6) is the preferred free RGB layer; the driver inverts the index
@@ -241,17 +259,32 @@ the time goes (`gfx.c:18-37`).
 
 The stock software keeps interpreting user input and switching its own pages while we cover
 the screen. We mirror the **result** — current page id, source slot, source app — instead of
-intercepting the event stream (`plat_pcm.c:2182-2197`). Page ownership is a whitelist:
-855/873 → radio, 375 → Bluetooth playback, 387 → home; anything unrecognised gives the screen
-back to the stock UI (`main_pcm.c:143-191`). Measured ids: FM = slot 11 / app 1, AUX = 26 / 6,
-Bluetooth = 40 / 7; `app` is the more stable discriminator. Page id `0xFFFE` is a
-page-transition sentinel and must be ignored.
+intercepting the event stream. Page ownership is a **whitelist**: 855/873 → radio, 375 →
+Bluetooth playback, 387 → AUX; anything unrecognised gives the screen back to the stock UI
+(`main_pcm.c:208-210`). Each whitelisted page is additionally gated on its own "Studio takes
+over" setting, so turning a source off in settings shows the stock page for it instead.
 
-`plat_poll_event()` sources touch from the read-only mirror plus a debug injection file
-(`echo "<type> <which> <arg> <x> <y>" > /tmp/studio_ev`). The FPGA/IPC path for rotary knobs
-and hard keys is **not connected** — polling shared IPC channels has hung both a car and a
-bench unit (`plat_pcm.c:2318-2323`). Scenes already handle `EV_ROTARY` and `EV_KEY_DOWN`, so
-they will work when that path lands; today those events do not arrive on the head unit.
+There is deliberately **no page id for the source page** — the stock's SOURCE control is a popup
+that never changes the page id, so a source/home page id does not exist. Ours is reached by the
+SOURCE hard key instead (§4.5). An earlier version of this document mapped 387 to "home"; that was
+wrong twice over, and the bench proved it.
+
+Measured ids: FM = slot 11 / app 1, AUX = 26 / 6, Bluetooth = 40 / 7; `app` is the more stable
+discriminator. Page id `0xFFFE` is a page-transition sentinel and must be ignored. **A whitelist,
+not a pattern** — "three digits means media" was disproved by page 913.
+
+`plat_poll_event()` sources touch from the read-only mirror, the SOURCE hard key (§4.5), and a
+debug injection file (`echo "<type> <which> <arg> <x> <y>" > /tmp/studio_ev`). The FPGA/IPC path
+is still **not connected** — polling shared IPC channels has hung both a car and a bench unit —
+so rotary knobs and every hard key other than SOURCE do not reach us.
+
+**The interaction model is touch, and only touch.** No scene draws a focus ring, a selection
+state or a cursor, and no scene handles `EV_ROTARY`, `K_UP`/`K_DOWN`/`K_LEFT`/`K_RIGHT` or
+`K_OK`. This is a product decision, not a limitation waiting to be lifted: without rotary
+selection there is no "currently selected item", so a highlight that means *where the cursor is*
+would be describing something that does not exist. Highlights are therefore reserved for facts —
+on the source page the one highlighted card is the source that is actually playing. The volume
+knob is the single exception and is handled globally, never by a scene.
 
 Hit targets are sized for a **resistive** touchscreen: five transport zones, adjacent regions
 touching at their midpoints, extended to the bottom of the screen for a height of 124 px and
@@ -264,7 +297,8 @@ falls inside its own hit region and that the dirty rectangle covers everything t
 
 Writing `*(S+0x9c) = 1` in PCM3Reload puts the stock HMI's own touch early-return into
 effect. Hard keys take a different branch of `CHBKey2MSMEventMapper::processEvent`
-(`0x085D3D94`) and are unaffected — that is the escape hatch (`plat_pcm.c:1688-1703`).
+(`0x085D3D94`) and are unaffected by this word — that is the escape hatch, and it is also why
+blocking a key needs its own patch (§4.5) (`plat_pcm.c:1688-1703`).
 **Whether this reliably stops pass-through is unresolved; see §5.** Our own receipt of the
 touch proves nothing either way: `read_touch` reads a cache *upstream* of the gate.
 
@@ -293,6 +327,70 @@ Constraints on any change here:
   where the field no longer holds our value (`:1840-1844`, which deliberately does **not**
   write back). The backstop for all three is the same: the change is pure RAM, and a power
   cycle restores stock behaviour.
+
+### 4.5 Hard keys, and the key gate
+
+Reading a hard key needs no patch. The stock key mapper's payload carries two fields
+(`plat_pcm.c:2846-2854`):
+
+* `+0x64` — the key code, **latched**. SOURCE is `0x0d`, MEDIA is `0x07`. Pressing the same key
+  twice does not change it, so a value alone is not an event.
+* `+0x6c` — the key **edge**, which pulses `3 → 0 → 3` on every press, repeats included.
+
+So the criterion is: *read `+0x64` on the tick where `+0x6c` reads 0*. A differential probe is
+permanently blind to this — the pulse is transient and both endpoints of a diff show `3`; it took
+a per-tick watcher to see it at all. Only whitelisted key codes are turned into events, today
+just `0x0d`.
+
+Reading is where "no flash" ends. With Studio covering the screen, the stock still receives
+SOURCE and still cycles its own source list underneath, and the touch gate does not cover keys —
+they take a different branch. Stopping that needs a firmware patch: `preProcessKey()` is **vtable
+slot 5 (`+0x14`)** of the mapper, and returning non-zero makes the stock drop the key. The vtable
+is in a read-only segment, so the patch is made in the IFS2 file: slot 5 is redirected to a code
+cave that walks a table of key codes and returns 1 on a hit, otherwise tail-jumps to the real
+`preProcessKey`.
+
+Two properties make that safe enough to flash:
+
+* **Disarmed, it is byte-for-byte stock.** The cave is armed by the *same word as the touch
+  gate*, checking the same two conditions (including `*(S+0x1a0)==2`). So the invariant grows
+  from *we cover the screen ⟺ the stock sees no touch* to *⟺ it also sees no SOURCE*, and Studio
+  needed no change at all to get it.
+* **It is table-driven.** Adding a key edits the table, not the code.
+
+Verified on the bench three ways, because any one alone proves nothing: with the gate armed the
+stock logged no page or source change across four presses while Studio received all four; MEDIA,
+which is not in the table, still worked normally; and stopping Studio restored stock behaviour
+completely.
+
+### 4.6 The status bar
+
+Every page draws the same bar (`shell_draw.c:127`): clock, volume value, volume level, speaker,
+laid out **right to left** from a caller-supplied right edge, returning the width it consumed so
+the page can lay out around it. The volume lives here because it used to be drawn by the
+Bluetooth page, and turning the knob made that page visibly jump.
+
+The row is defined by its **baseline**, not by a box. An earlier version positioned text from an
+approximated mid-line, and every element sat on a slightly different line; the constants now
+derive from `SB_BL` and a cap-height band (`shell_draw.c:109-119`), and the residual spread
+measured on rendered pixels is about 1 px. Two bugs only became visible by measuring the output
+rather than looking at it: a hand-guessed baseline offset that was 4.5 px out, and a helper whose
+coordinate was a centre while the caller passed a top-left.
+
+The numbers came from phone status bars — icons and text are near the same height there, so an
+icon noticeably taller than the digits reads as wrong. That relationship is checked at startup
+against the text cap height, and the check was falsified before being trusted: restoring the
+previously rejected icon size makes it fire.
+
+### 4.7 Languages
+
+UI strings live in one X-macro table (`pcm_i18n.h:29`) that expands to both an id enum and the
+per-language arrays, so a new string cannot be added to one language and forgotten in the other.
+`T(id)` reads the current language on **every call** (`:90-93`) rather than caching a pointer,
+which is what makes switching language redraw immediately instead of at next boot. English is the
+default; Simplified Chinese is the other. A build lint rejects a **Chinese** literal that reaches
+a drawing call (`build.sh:32-42`) — it catches the common way a translated string gets hard-coded,
+but note it cannot see an English literal drawn directly, so that class still needs review.
 
 ---
 
@@ -327,5 +425,5 @@ Not hardware limits — decisions:
 ---
 
 This document covers the Bluetooth playback page and the engine. The other scenes
-(`scene_home`, `scene_radio`, `scene_aux`, `scene_settings`) exist and use the same
+(`scene_source`, `scene_radio`, `scene_aux`, `scene_settings`) exist and use the same
 accessors; their end-to-end status on the head unit is not covered here.

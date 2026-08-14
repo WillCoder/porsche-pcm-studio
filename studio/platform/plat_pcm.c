@@ -956,7 +956,14 @@ void plat_tick_watch(void){
             plat_log("⚠ [上屏] 欠着的换页 200ms 没补上 -> 补偿路径有问题\n");
             g_swap_t0 = plat_now_ms();
         }
-        swap_bank();
+        { unsigned before = g_last_swap;
+          swap_bank();
+          /* 📏 补上了要**说出来**。不打这一行, "补偿路径在不在工作"就只能靠读代码 ——
+           *   而它正是那种平时不触发、真触发时你也不知道的东西。 */
+          if(g_last_swap != before){
+              plat_log("[上屏] 补上了被节流吞掉的那次换页(欠了 ");
+              p_logd((int)(plat_now_ms() - g_swap_t0)); plat_log("ms)\n");
+          } }
     }
     if(g_mode != 2) yield_check();
 }
@@ -2129,6 +2136,28 @@ void plat_post_cmd(void){
             plat_log(" 长度 "); p_logd(g_watch_len); plat_log(" (停: 24)\n");
             break;
         case 24: g_watch_len = 0; g_watch_have = 0; plat_log("[盯] 停\n"); break;
+        /* 🧪 只为**证伪补偿路径**而存在: 背靠背换两次页, 第二次必落在 50ms 节流窗口里,
+         *   于是 g_swap_pending 被置上, 随后 plat_tick_watch 必须把它补掉。
+         *   没有这条命令, "丢帧补偿"只能靠运气撞上 —— 而撞不上的时候你分不清
+         *   是"没坏"还是"没测到"。 */
+        case 26:
+            if(!g_dbuf){ plat_log("[测试] 没开双缓冲, 这条命令没意义\n"); break; }
+            if(!g_cover || g_mode == 2){ plat_log("[测试] 当前没盖着屏幕, 先接管再测\n"); break; }
+            /* 🚨 第一版在两次换页之间各跑了一次 present_diff, 而 g_force_full=2 让它们都是
+             *   **整屏拷贝(~130ms)** ⇒ 两次换页天然隔 130ms, 根本撞不上 50ms 节流窗。
+             *   正确做法: 两次 swap_bank **背靠背**, 中间什么都不做。
+             *   📌 顺带一个真发现: 这个节流在实际中很少触发, 因为一次 present(渲染+拷贝)
+             *      本来就常常超过 50ms —— 所以"丢帧"未必是当初那次"按键没反应"的根因,
+             *      我之前把它说死了。修法方向没错, 但根因**至今没被证实**。 */
+            { unsigned s1, s2;
+              g_force_full = 2; present_diff();      /* 先把内容准备好 */
+              s1 = g_last_swap; swap_bank();         /* 第一次: 应该成功 */
+              s2 = g_last_swap; swap_bank();         /* 第二次: 0ms 后, 必被节流 */
+              plat_log("[测试] 第一次换页="); plat_log(g_last_swap != s1 ? "成功 ✓" : "被吞 ⚠");
+              plat_log("  第二次="); plat_log(g_last_swap != s2 ? "成功 ⚠(没撞上)" : "被吞 ✓");
+              plat_log("  欠账="); p_logd(g_swap_pending);
+              plat_log(g_swap_pending ? "  -> 等 tick_watch 补\n" : "  ⚠ 没记上账\n"); }
+            break;
         case 13: { int rnd = -1, rep = -1;  /* MME 只读探针: 随机 + 重复。**改之前先跑它记下原值** */
             if(mme_get_mode(0, &rnd)) plat_log("[MME] 读随机失败\n");
             else { plat_log("[MME] 随机="); p_logd(rnd);

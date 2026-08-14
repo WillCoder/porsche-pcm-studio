@@ -143,7 +143,6 @@ static void radio_render(u16_ *fb, const PcmState *st, unsigned t_ms){
             int k;   /* 左侧 3px 暖色指示条 */
             for(k=0;k<3;k++) gfx_pill(x+7+k, PC_Y+12, 1, PC_H-24, 233,178,74);
         }
-        if(sel) gfx_rrect_ring(x, PC_Y, PC_W, PC_H, 14, 233,178,74, 220);
         /* 序号 */
         {
             char n[3]; n[0]='0'+i+1; n[1]=0;

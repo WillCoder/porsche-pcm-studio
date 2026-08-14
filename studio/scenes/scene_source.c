@@ -21,7 +21,6 @@
 #define S_BG0   11,14,20
 #define S_BG1   23,29,41
 #define S_CARD  27,34,48
-#define S_CARD_SEL 38,50,72
 #define S_INK   243,245,249
 #define S_INK2  154,163,178
 #define S_INK3  97,106,121
@@ -36,13 +35,24 @@
 #define CARD_Y   150
 #define CARD_X0  ((SCR_W - (SC_N*CARD_W + (SC_N-1)*CARD_GAP))/2)
 
-/* 齿轮入口(右上角)。绘制中心 + 命中区分开写, 但命中区**由绘制中心推出来** ——
- * 2026-08-14 在蓝牙页栽过一次: 画在一处、命中判在另一处, 版式一改就错位。 */
-#define GEAR_CX  (SCR_W - 62)
-#define GEAR_CY  62
-#define GEAR_HIT 46            /* 命中区半边长: 92×92, 电阻屏够按 */
+/* 齿轮入口 —— **坐进状态栏那一行的最右端**, 和时钟/音量同一条中线。
+ * 🎨 上一版把它单独摆在右上角(62,62), 结果直接压在状态栏的时钟上。
+ *   它是导航控件不是状态, 但既然共用这一行, 就得排进同一个序列里, 而不是各占各的角。
+ * 命中区仍然**由绘制中心推出来**, 别分开写(蓝牙页为此栽过一次)。 */
+#define GEAR_CX  (SB_R - 14)
+#define GEAR_CY  SB_ICY
+#define GEAR_HIT 34            /* 68×68, 电阻屏够按, 又不至于压到时钟 */
+/* 图标外缘半径。**别直接调它, 调完必须过 source_enter 里的高度守卫** ——
+ * 状态栏里图标和文字要**差不多高**(iPhone/Android 都是这样), 大一圈就跳出来了。 */
+#define GEAR_EXT (SB_ICON * 2 / 3)
+/* 实测标定: 画出来的墨迹总高 ≈ 2.08·ext + 3(抗锯齿外扩)。ext=9 量到 22px, ext=8 量到 19px。 */
+#define GEAR_PX  ((208 * GEAR_EXT) / 100 + 3)
+/* ⚠️ 本想做成编译期断言, 但 SB_CAP 顺着 SFONT_ASC 走到 gfx.c 里的**变量** SF_ASC,
+ *   不是常量表达式 ⇒ 只能放在 source_enter 的开机自检里。 */
 
-static int g_src_sel = 0;      /* 旋钮选中 0..SC_N-1 */
+/* 🚫 **没有"选中项"这个概念**(用户 2026-08-14 定): 不做旋钮选中, 只做触摸。
+ *   以前每张卡有黄色 focus 框 + 上浮 6px, 那是给旋钮用的 ——
+ *   留着不只是多余, 它会让人以为存在"当前选中项", 而点哪张就是哪张。 */
 
 /* 🚨 `label` 存的是**文案 id 不是字符串**。表是 `static const`, 拿 T() 初始化既不是
  *   常量表达式(编不过), 更要命的是**会把语言冻在启动那一刻** —— 用户在设置里换了语言,
@@ -103,20 +113,35 @@ static void src_icon(int cx, int cy, int kind, int r, int g, int b){
     }
 }
 
-/* 齿轮 —— 圆盘 + 8 个方齿 + 中心孔 */
-static void src_gear(int cx, int cy, int rad, int r, int g, int b){
-    static const int ux[8]={0,45,64,45,0,-45,-64,-45};
-    static const int uy[8]={-64,-45,0,45,64,45,0,-45};
-    int i, d, s;
-    gfx_circle(cx, cy, rad, r,g,b);
-    for(i=0;i<8;i++){
-        for(d = rad-2; d <= rad+7; d++){
-            int px = cx + ux[i]*d/64, py = cy + uy[i]*d/64;
-            int nx = -uy[i], ny = ux[i];
-            for(s=-3;s<=3;s++) gfx_blend(px + nx*s/64, py + ny*s/64, r,g,b, 235);
-        }
+/* 设置图标 —— **三条滑杆**, 不是齿轮。
+ * 🎨 2026-08-14 用户判齿轮丑, 而且原因是结构性的:
+ *   齿轮在 ~21px 下要塞 8 个齿, 每个齿才 4px 宽, 必然糊成一团;
+ *   而且它是**硬边逐像素**画的(gfx_circle + 方齿), 不像蓝牙标/播放键走**距离场**(gfx_shape),
+ *   那条路才有抗锯齿。小尺寸下"细节多 + 硬边"是最差的组合。
+ * ⇒ 换成全是直线和圆点的滑杆图标: 同样是公认的"设置"语义, 但小尺寸下反而更清楚,
+ *   而且能整条走 gfx_shape 拿到抗锯齿。
+ * ext = 外缘半径(和状态栏其它图标一个量纲)。 */
+static void src_gear(int cx, int cy, int ext, int r, int g, int b){
+    /* 🚨 比例是放大看出来的, 别随手改:
+     *   第一版 杆粗 0.22·ext(2px)、行距 0.62·ext(3.6px)、钮半径 0.30·ext(直径 5.4px)
+     *   ⇒ 钮直接压到邻杆, 三条糊成一坨。**钮的直径必须小于行距**, 而且要留得出白。 */
+    float w  = (float)ext * 0.16f; if(w < 1.2f) w = 1.2f;   /* 杆: 细 */
+    float kr = (float)ext * 0.26f; if(kr < 2.0f) kr = 2.0f; /* 钮: 直径 ≈ 0.52·ext < 行距 0.78·ext */
+    float x0 = (float)cx - (float)ext * 0.92f, x1 = (float)cx + (float)ext * 0.92f;
+    /* 三条杆的 y 和各自钮的 x —— 钮**必须错开**, 排成一列就成了汉堡菜单 */
+    const float ry[3] = { -0.78f, 0.0f, 0.78f };
+    const float kx[3] = { -0.34f, 0.38f, -0.06f };
+    int i;
+    for(i = 0; i < 3; i++){
+        float y = (float)cy + ry[i] * (float)ext;
+        float ln[4] = { x0, y, x1, y };
+        float kc[4];
+        gfx_shape(ln, 2, w, 0, 0, r, g, b, 200);
+        kc[0] = kc[2] = (float)cx + kx[i] * (float)ext; kc[1] = kc[3] = y;
+        /* 钮 = **两点重合的线段**(不是 n=1 —— 单点形不成线段, 什么都不画,
+         *   实测那样画出来是个汉堡菜单)。距离场对退化线段天然给出抗锯齿的圆点。 */
+        gfx_shape(kc, 2, kr, 0, 0, r, g, b, 255);
     }
-    gfx_circle(cx, cy, rad/3, S_BG1);
 }
 
 static void source_render(u16_ *fb, const PcmState *st, unsigned t_ms){
@@ -126,50 +151,32 @@ static void source_render(u16_ *fb, const PcmState *st, unsigned t_ms){
      * 视觉上也更像一套系统: 一个座舱只有一个光源。改这个数之前先想清楚。 */
     gfx_backdrop(S_BG0, S_BG1, 180, 140, 330, 58,120,190, 0);
 
-    gfx_text(56, 56, T(STR_SOURCE), 2, S_INK);
+    /* 状态栏一整行: 左边页名, 右半(音量+时钟)由 shell_statusbar 画。 */
+    shell_statusbar(st, GEAR_CX - GEAR_HIT + 4, S_INK2);   /* 给齿轮让位 */
+    sb_text(SB_L, T(STR_SOURCE), S_INK);
 
-    /* 时钟。🚨 走 pcm_clock(), "拿不到"这个分支必须处理 —— 台架 RTC 给 -1,
-     * 直接打印会渲出乱码(2026-08-13 真截图抓到过)。 */
-    {
-        char b[8]; int p=0, h, m;
-        if(pcm_clock(st, &h, &m)){
-            b[p++]='0'+(h/10); b[p++]='0'+(h%10); b[p++]=':';
-            b[p++]='0'+(m/10); b[p++]='0'+(m%10); b[p]=0;
-            gfx_text(GEAR_CX - 34 - gfx_text_w(b,1), 64, b, 1, S_INK2);
-        }
-    }
-
-    /* 设置入口(齿轮) */
-    src_gear(GEAR_CX, GEAR_CY, 15, S_INK2);
+    /* 设置入口 —— 画小了不影响好按: 命中区是 GEAR_HIT 单独给的(68×68)。 */
+    src_gear(GEAR_CX, GEAR_CY, GEAR_EXT, S_INK2);
 
     for(i=0;i<SC_N;i++){
         int x = CARD_X0 + i*(CARD_W+CARD_GAP);
-        int sel = (i == g_src_sel);
         int active = (SRC_CARDS[i].src == st->source);
         int mine = plat_cfg_get(SRC_CARDS[i].cfg);
         int y = CARD_Y;
         int ir, ig, ib, lr, lg, lb;
 
-        if(sel) y -= 6;
-        if(sel){
-            gfx_rrect(x, y, CARD_W, CARD_H, 22, S_CARD_SEL);
-            gfx_rrect_ring(x, y, CARD_W, CARD_H, 22, S_AMBER, 200);
-        } else {
-            gfx_rrect(x, y, CARD_W, CARD_H, 22, S_CARD);
-        }
+        gfx_rrect(x, y, CARD_W, CARD_H, 22, S_CARD);
 
-        /* ⚠️ 颜色宏是三个逗号分隔的分量, **绝不能放进三元** —— 会被解析成
-         *   `cond?(a,b,c):d` 再把剩下两个当别的实参, 编译零错误但画错色
-         *   (2026-08-14 进度条本该琥珀画成了青色)。构建期 lint 也拦这个写法。 */
-        if(sel){ ir=233; ig=178; ib=74;  lr=243; lg=245; lb=249; }
-        else   { ir=154; ig=163; ib=178; lr=154; lg=163; lb=178; }
+        /* 唯一的高亮理由是"**这个音源正在用**", 不是"光标停在这儿"。 */
+        if(active){ ir=233; ig=178; ib=74;  lr=243; lg=245; lb=249; }
+        else      { ir=154; ig=163; ib=178; lr=154; lg=163; lb=178; }
 
         src_icon(x+CARD_W/2, y+80, SRC_CARDS[i].icon, ir,ig,ib);
         {
             const char *lb2 = T(SRC_CARDS[i].label);   /* 每帧现查 -> 换语言当场生效 */
             gfx_text(x + (CARD_W-gfx_text_w(lb2,1))/2, y+142, lb2, 1, lr,lg,lb);
         }
-        /* 正在使用的音源: 标签正下方一颗暖点 */
+        /* 正在使用的音源: 标签正下方一颗暖点(配合上面的暖色图标/文字) */
         if(active) gfx_circle(x+CARD_W/2, y+186, 5, S_AMBER);
         /* 没开接管 ⇒ 明说"原厂"。不说的话用户点完看到原厂页会以为坏了。
          * ⚠️ 放**卡片左上角**当角标, 不放底部 —— 底部是"正在使用"那颗点的地方,
@@ -198,21 +205,12 @@ static int src_card_hit(int x, int y){
  *   不提示的话用户看到的就是"点了没反应", 而这是最难描述也最难归因的故障。
  *   宁可弹一句难看的提示, 也不要装作什么都没发生。 */
 static void src_pick(int i){
-    g_src_sel = i;
     if(plat_command(CMD_SET_SOURCE, SRC_CARDS[i].src) != 0)
         shell_toast(T(STR_SRC_FAIL));
 }
 
 static int source_event(const PcmEvent *ev, const PcmState *st){
-    if(ev->type == EV_ROTARY && ev->which == KNOB_TUNE){
-        g_src_sel = (g_src_sel + ev->arg + SC_N) % SC_N;
-        return 1;
-    }
-    if(ev->type == EV_KEY_DOWN){
-        if(ev->arg == K_LEFT)  { g_src_sel = (g_src_sel+SC_N-1)%SC_N; return 1; }
-        if(ev->arg == K_RIGHT) { g_src_sel = (g_src_sel+1)%SC_N; return 1; }
-        if(ev->arg == K_OK)    { src_pick(g_src_sel); return 1; }
-    }
+    /* 🚫 不处理旋钮/方向键/OK —— 没有"选中项"就没有它们的语义。只认触摸。 */
     if(ev->type == EV_TOUCH_DOWN){
         int i;
         /* 齿轮先判 —— 它在右上角, 不和卡片重叠, 顺序其实无所谓, 但先判小目标更稳。 */
@@ -237,6 +235,12 @@ static void source_enter(void){
     }
     /* 齿轮的命中区不许压到卡片上 */
     if(src_card_hit(GEAR_CX, GEAR_CY) >= 0) bad = 1;
+    /* 图标不许比同一行的文字大一圈(2026-08-14 栽过: 22px 图标配 13px 数字, 一眼就突兀)。
+     * 这条只拦回归, **不证明好看** —— 好不好看还是得放大了自己看。 */
+    if(GEAR_PX < SB_CAP || GEAR_PX > SB_CAP * 8 / 5){
+        plat_log("‼️ [音源页] 自检失败: 设置图标和状态栏文字不成比例(改 GEAR_EXT)\n");
+        bad = 1;
+    }
     if(bad) plat_log("‼️ [音源页] 自检失败: 画的位置和命中区对不上, 点了会没反应\n");
 }
 

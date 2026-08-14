@@ -740,17 +740,10 @@ static void render_bt_waiting(const PcmState *st, unsigned t_ms){
         draw_v1_tile(&still, t_ms);
     }
 
-    /* 刊头只留蓝牙标 + 时钟/电量。设备名挪到正文去当主角。 */
-    {   char buf[16]; int tw = 0, h, m;
-        if(pcm_clock(st, &h, &m)){
-            buf[0]=(char)('0'+h/10); buf[1]=(char)('0'+h%10); buf[2]=':';
-            buf[3]=(char)('0'+m/10); buf[4]=(char)('0'+m%10); buf[5]=0;
-            tw = gfx_text_w(buf,1);
-            text_base(760 - tw, 74, buf, 1, C_MICRO);
-        }
-        draw_bt_mark(V1_COL_X + 8, 65, 8, C_MICRO, 255);
-        text_base(V1_COL_X + 28, 74, T(STR_BLUETOOTH), 1, C_MICRO);
-        { int lv; if(pcm_battery(st, &lv)) draw_battery((tw ? 760 - tw - 18 : 760) - 26, 55, lv); }
+    /* 状态栏(等待态): 左边只放"蓝牙", 右半由 shell_statusbar 画。 */
+    {   shell_statusbar(st, SB_R, C_MICRO);
+        draw_bt_mark(SB_L + SB_ICON/2, SB_ICY, SB_ICON/2, C_MICRO, 255);   /* cx,cy 是中心 */
+        sb_text(SB_L + SB_ICON + SB_GAP, T(STR_BLUETOOTH), C_MICRO);
     }
 
     switch(bt_wait_kind(st)){
@@ -783,18 +776,24 @@ static void render_v1_plus(const PcmState *st, unsigned t_ms){
     gfx_backdrop(11,14,20, 23,29,41, 180, 140, 330, 58,120,190, 120);
     draw_v1_tile(st, t_ms);
     /* 右栏顶: 蓝牙标 + 真设备名 + 电量 + 时钟 */
+    /* 状态栏(播放态): 左边 = 蓝牙标 + 真设备名 + 手机电量, 右半由 shell_statusbar 画。
+     * ⚠️ 这一页有**两处刊头**(等待态/播放态), 两处都必须走同一条路 ——
+     *   2026-08-14 只改了一处, Mac 预览一眼看出来(播放态没显示音量)。 */
     {   const char *dev = st->device[0] ? st->device : T(STR_BLUETOOTH);
-        int tw = 0, h, m;
-        if(pcm_clock(st, &h, &m)){        /* 拿不到就整个不画 —— 访问器强制你处理这个分支 */
-            buf[0]=(char)('0'+h/10); buf[1]=(char)('0'+h%10); buf[2]=':';
-            buf[3]=(char)('0'+m/10); buf[4]=(char)('0'+m%10); buf[5]=0;
-            tw = gfx_text_w(buf,1);
-            text_base(760 - tw, 74, buf, 1, C_MICRO);
-        }
-        draw_bt_mark(V1_COL_X + 8, 65, 8, C_MICRO, 255);
-        { int lv; if(pcm_battery(st, &lv)) draw_battery((tw ? 760 - tw - 18 : 760) - 26, 55, lv); }
-        text_base_lim(V1_COL_X + 28, 74, dev, 1,
-                      (tw ? 760 - tw - 52 : 734) - (V1_COL_X + 28), C_MICRO);
+        int sw    = shell_statusbar(st, SB_R, C_MICRO);
+        int avail = (SB_R - sw - SB_GRP) - (SB_L + SB_ICON + SB_GAP);
+        int lv, bw = 0, nw, x = SB_L;
+        /* 🎨 左半是**一组连排的东西**: 蓝牙标 → 设备名 → 手机电量。
+         *   电量是**这个手机的**属性, 就该紧跟在设备名后面, 而不是按右边界去摆
+         *   (那样它会悬在中间不挨着任何东西)。
+         *   全组用状态栏字号 SB_TXT, 并对齐到同一条光学中线 SB_MID。 */
+        if(pcm_battery(st, &lv)) bw = 26 + SB_GAP;
+        draw_bt_mark(x + SB_ICON/2, SB_ICY, SB_ICON/2, C_MICRO, 255);      /* cx,cy 是中心 */
+        x += SB_ICON + SB_GAP;
+        nw = sb_text_w(dev);
+        if(nw > avail - bw) nw = avail - bw;
+        gfx_text_lim_s(x, SB_TOP, dev, SB_TXT, avail - bw, C_MICRO);
+        if(bw) draw_battery(x + nw + SB_GAP, SB_ICY - 7, lv);
     }
     /* 🚨 曲名 36px(sc16=24 = 1.5×), 用户 2026-08-14 定的 —— 原来是 2×=48px, 太大。
      *   字库烤在 24px, 以前只有 24/48/72 三档, 36 落在中间只能重烤一份字库;

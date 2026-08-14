@@ -2,9 +2,13 @@
 
 One C source tree, two backends: a Mac backend for offline iteration and an SH-4 / QNX backend that runs on the head unit (SH-4A, QNX 6.3.2, 800×480). Everything below is bench procedure — it does not cover vehicle installation or the boot autostart hook.
 
-**Zero-flash** means Studio never reprograms a raw flash partition and never patches the stock firmware image; it copies ordinary files into a mounted filesystem and claims a display layer at runtime. It does *not* mean nothing is written to persistent storage — `/HBpersistence` is NOR flash, which matters in Trap ②.
+**"Zero-flash" is about deploying Studio, and nothing more.** Installing and running it reprograms no raw partition and patches no firmware image: it copies ordinary files into a mounted filesystem and claims a display layer at runtime. Two things it does *not* mean. (1) Nothing is written to persistent storage — `/HBpersistence` is NOR flash, and Studio's own settings file lives there, which matters in Trap ②. (2) The project needs no flashing — it depends on two flashed code caves for anything that changes stock state (IFS1: volume, source, tuner; IFS2: the SOURCE key gate). Those are separate, genuinely risky operations, and they are not covered by this document.
 
-**Published:** `studio/sys/`, `studio/scenes/*.c`, `studio/platform/`, both entry points, `studio/tools/{build.sh,bake_font.py,studio_server.py}`. **Not published:** the baked `.fnt` fonts, the fallback atlas `studio/scenes/studio_font.h`, the generated `studio/platform/puppet_addr.h`, the launcher `gostudio.sh`, the SH-4 link script `dev/build_coexist_vol.sh`, the bench serial tooling. So `build.sh mac` builds from this repo as-is, but **`build.sh pcm` does not** — `plat_pcm.c` includes `puppet_addr.h` and `../../coexist-app/mvp/gf_defs.h`, neither of which is here.
+**Published:** `studio/sys/`, `studio/scenes/*.c`, `studio/platform/`, both entry points, `studio/tools/{build.sh,bake_font.py,studio_server.py}`. **Also published because the build needs them:** `studio/platform/puppet_addr.h` and `coexist-app/mvp/gf_defs.h` — `plat_pcm.c` includes both, and for the repo's first two commits neither was here, so nobody could build the PCM backend from a clean clone. **Not published:** the baked `.fnt` fonts, the fallback atlas `studio/scenes/studio_font.h` (rasterised from a proprietary system font; the build does not need it — `build.sh mac` passes `-DSTUDIO_FONT_EXTERNAL`, which loads a `.fnt` at runtime instead), the launcher `dev/bench/gostudio`, the SH-4 link script `dev/build_coexist_vol.sh`, the bench serial tooling.
+
+So `build.sh mac` builds from this repo as-is, but **`build.sh pcm` still does not** — not for the old reason (both headers are here now), but because it shells out to `dev/build_coexist_vol.sh`, which in turn wants a set of SH-4 stub sources under `dev/sh4tools/` and a `sh4build` Docker image. That is a cross-toolchain, not part of the product, and it is not published. What *is* published is every line of the program itself.
+
+The sync script that produces this repo ends with a **smoke build of the published tree**, run with the same flags as `build.sh mac`. It compiles the maintainer's own tree first as a control, so a red result means the repo is broken rather than the check — the first version of that check had the flags wrong and reported two failures that did not exist.
 
 ## 0. Quick reference
 
@@ -17,7 +21,7 @@ One C source tree, two backends: a Mac backend for offline iteration and an SH-4
 | Browser console for the preview | `python3 studio/tools/studio_server.py` → <http://localhost:8770> |
 | Bake the font | §3 — the `.fnt` is **not** in the repo |
 | Ferry files to the unit | USB stick, §4 |
-| Start on the unit | `/HBpersistence/dev/etc/gostudio.sh` |
+| Start on the unit | `/HBpersistence/dev/bin/gostudio` |
 | Stop on the unit | `echo x > /tmp/studio.stop` — **never `slay`** |
 | Device log | `/tmp/studio.log` (`studio/platform/plat_pcm.c:85`) |
 
@@ -34,9 +38,9 @@ studio/main_mac.c  →  platform/plat_mac.c  +  scenes/*.c      (host)
 studio/main_pcm.c  →  platform/plat_pcm.c  +  scenes/*.c      (SH-4 / QNX)
 ```
 
-The one conditional compile in shared code is the font-source switch at `studio/scenes/gfx.c:583`: `#ifdef STUDIO_FONT_EXTERNAL` loads a runtime blob, `#else` (`gfx.c:608`) compiles in `studio/scenes/studio_font.h`. `studio/main_pcm.c:10` hard-defines the macro and the Mac build passes `-DSTUDIO_FONT_EXTERNAL` (`build.sh:43`), so both platforms take the external-blob branch.
+Shared code carries three build-time switches, and only one of them is about the platform: `BT_WAVEBAR` and `BT_TONEARM` in `scene_btplay.c` are opt-in decorations, off by default. The platform-relevant one is the font-source switch at `studio/scenes/gfx.c:583`: `#ifdef STUDIO_FONT_EXTERNAL` loads a runtime blob, `#else` (`gfx.c:608`) compiles in `studio/scenes/studio_font.h`. `studio/main_pcm.c:10` hard-defines the macro and the Mac build passes `-DSTUDIO_FONT_EXTERNAL` (`build.sh:43`), so both platforms take the external-blob branch.
 
-`studio/sys/pcm_caps.h` is a capability contract: anything the hardware or the Bluetooth stack cannot deliver is `#define CAP_X 0` with its evidence attached. Read it before adding a feature. It is documentation, **not** compile-time enforcement — there are zero `#if CAP_X` call sites and `PCM_REQUIRE_CAP` is unused (`pcm_caps.h:113-140`).
+`studio/sys/pcm_caps.h` is a capability contract: anything the hardware or the Bluetooth stack cannot deliver is `#define CAP_X 0` with its evidence attached. Read it before adding a feature. It is documentation, **not** compile-time enforcement — there are zero `#if CAP_X` call sites and `PCM_REQUIRE_CAP` is unused (see the note at the end of `pcm_caps.h`).
 
 ## 2. Building
 
@@ -69,8 +73,9 @@ Deploy the **stripped** output; `readelf -d` should show exactly five `NEEDED` e
 | `cond ? C_X : C_Y` (`:16-17`) | `studio/scenes/` | Colour constants are three comma-separated components (`#define C_AMBER 239,181,74`, `scene_btplay.c:59`). A ternary between two of them re-associates through the comma operator, keeps the argument count unchanged, compiles silently, and lets only the first channel follow the condition. Use `if/else` (`scene_btplay.c:584-585`). |
 | `read(...) > 0` loops (`:21-23`) | `studio/main_pcm.c` | `read()` returning **-1** is an error, not EOF; a hand-rolled loop treats it as EOF and truncates at a varying offset. Use `read_all()` (`main_pcm.c:40-53`), which separates `0` from `<0` and reports the retry count. |
 | `plat_ts_*` / `plat_peek2` / `plat_touchgate` (`:28-30`) | `studio/scenes/` | Scenes must not touch engine internals (`plat_internal.h`). The touch gate enforces the "covering ⟺ gate armed" invariant; if a scene arms or disarms it, nobody can reason about it. |
+| Chinese literals inside `gfx_text*` / `shell_toast` (`:39-43`) | `studio/scenes/`, `studio/sys/` | A translated string hard-coded at the call site instead of going through the `pcm_i18n.h` table, which would leave it stuck in one language. Note the inverse is **not** caught: an English literal drawn directly still compiles. |
 
-All three greps skip lines whose match sits in a comment (`grep -vE ':[[:space:]]*[*/]'`, `:16`, `:22`, `:29`), so keep the comment marker at line start when documenting a bad pattern.
+All four greps skip lines whose match sits in a comment (`grep -vE ':[[:space:]]*[*/]'`, `:16`, `:22`, `:29`), so keep the comment marker at line start when documenting a bad pattern.
 
 ### 2.2 The self-check `ck`
 
@@ -109,16 +114,18 @@ The Mac side loads the same file from the repo (`main_mac.c:22-23`) and prints `
 |---|---|---|
 | `studio/pcm_studio.stripped` | `/HBpersistence/dev/bin/studio` | `chmod +x` |
 | `studio/studio_notosc.fnt` | `/HBpersistence/dev/share/studio.fnt` | 3,938,152 B, changes rarely |
-| `gostudio.sh` | `/HBpersistence/dev/etc/gostudio.sh` | `chmod +x` |
+| `gostudio` | `/HBpersistence/dev/bin/gostudio` | `chmod +x` |
 
-`/HBpersistence/dev/` is a development area laid out as `bin/ lib/ share/ pkg/ etc/ var/`. Use it rather than `/tmp`, which is a RAM disk and is empty after every power cycle. `/tmp` is a fallback in both candidate lists, not an override: the persistent copy wins whenever it is present and passes content validation (`main_pcm.c:63-68`, `:99-101`).
+A fourth persistent file is **not** ferried — Studio writes it itself: `/HBpersistence/dev/etc/studio.conf`, holding the per-source "Studio takes over" toggles and the UI language, rewritten immediately on every settings change. `mkdir -p /HBpersistence/dev/etc` must exist or settings silently fail to persist and revert to defaults (Bluetooth on, FM and AUX off, English) at next start.
+
+`/HBpersistence/dev/` is a development area laid out as `bin/ lib/ share/ pkg/ etc/ var/`. Use it rather than `/tmp`, which is a RAM disk and is empty after every power cycle. `/tmp` is a fallback in both candidate lists, not an override: the persistent copy wins whenever it is present and passes content validation.
 
 ```bash
 # host
 ./studio/tools/build.sh pcm
 cp studio/pcm_studio.stripped /Volumes/<STICK>/studio
 cp studio/studio_notosc.fnt   /Volumes/<STICK>/studio.fnt
-cp studio/tools/gostudio.sh   /Volumes/<STICK>/gostudio.sh
+cp dev/bench/gostudio        /Volumes/<STICK>/gostudio
 sync
 ```
 
@@ -130,10 +137,12 @@ On the unit (serial console), **after it has fully booted** — the autorun mech
 mount | grep umass                 # mount point varies: /fs/usb0 or /mnt/umass<xxxx>
 U=/fs/usb0                         # set to what you actually saw
 mount -uw $U                       # only if it mounted read-only
+echo x > /tmp/studio.stop          # 🚨 STOP IT FIRST — see the trap below
+pidin -P studio | grep studio      # must print nothing before you copy
 cp $U/studio      /HBpersistence/dev/bin/studio
 cp $U/studio.fnt  /HBpersistence/dev/share/studio.fnt
-cp $U/gostudio.sh /HBpersistence/dev/etc/gostudio.sh
-chmod +x /HBpersistence/dev/bin/studio /HBpersistence/dev/etc/gostudio.sh
+cp $U/gostudio /HBpersistence/dev/bin/gostudio
+chmod +x /HBpersistence/dev/bin/studio /HBpersistence/dev/bin/gostudio
 ```
 
 Verify with the `ck` line at startup (§2.2), not `ls`.
@@ -148,15 +157,19 @@ Bench shell limits, worth re-checking on your own unit before scripting: `head`,
 
 **③ A broken leftover file will shadow a good one.** Both candidate lists (font, self-checksum) are ordered by path and `open()` succeeding on the first candidate is enough to win — a half-written 2.8 MB remnant at `/HBpersistence/dev/share/studio.fnt` was loaded forever while the good copy in `/tmp` was never touched. Acceptance must be by **content**, not by `open()`: `load_font()` treats `gfx_font_use_blob()` accepting the blob as the test and logs the path and size of every rejected candidate (`main_pcm.c:56-94`). When something behaves like an old version, check whether an earlier candidate path still holds a file.
 
-**④ A build script that prints a stale checksum will get a stale binary onto the unit.** Two shapes to close: an output filter that swallows the inner script's failure line (without `pipefail` the pipeline's exit status comes from `grep`, so the script prints the previous `ck` and exits 0), and `strip` running before the error check, which regenerates a `.stripped` from the *previous* unstripped binary — old bytes, fresh timestamp. `build.sh` deletes both artifacts before and after a failed build, sets `pipefail`, filters only `warning:`, and requires the artifact to exist (`build.sh:65-71`). Verify any such guard by injecting a deliberate syntax error and checking that it goes red.
+**④ A build script that prints a stale checksum will get a stale binary onto the unit.** Two shapes to close: an output filter that swallows the inner script's failure line (without `pipefail` the pipeline's exit status comes from `grep`, so the script prints the previous `ck` and exits 0), and `strip` running before the error check, which regenerates a `.stripped` from the *previous* unstripped binary — old bytes, fresh timestamp. `build.sh` deletes both artifacts before and after a failed build, sets `pipefail`, filters `warning:` lines and the source-echo lines that follow them, and requires the artifact to exist (`build.sh:65-71`). Verify any such guard by injecting a deliberate syntax error and checking that it goes red.
+
+**⑤ `cp` over a *running* binary fails silently.** On the bench it does not error; it just does not replace the file, and the install script goes on to report success. It is worse than it sounds: two consecutive builds can be **exactly the same size** (132232 B, observed), so `ls -l` shows nothing wrong and the timestamp is fresh. Half an hour was lost debugging an old binary that way, and the only thing that eventually gave it away was a probe command answering "unknown level 20". Two consequences: stop Studio *before* copying (`echo x > /tmp/studio.stop`, then confirm with `pidin -P studio` that it is gone, and refuse to copy if it is not — the installer script does this itself), and treat only the startup `ck` line as proof of which binary is running. **`ls -l` is not evidence.**
+
+**⑥ Never run two studios.** The second one's startup `disable + update` pulls the layer out from under the first, whose next `gf` call then blocks on the graphics server; the survivor cannot be stopped by `/tmp/studio.stop` and the unit needs a power cycle. It is worse than a crash because the symptoms look like something else entirely: a command file that empties with nothing responding, or a startup log with the `ck` line missing, because `plat_log` truncates per process and the refusing instance would otherwise wipe the live one's log. Studio now takes a single-instance lock at `/tmp/studio.lock` as its very first action and `gostudio` refuses to launch over a running instance — but only if you start it through `gostudio`.
 
 ## 6. Running and stopping
 
 ```sh
-/HBpersistence/dev/etc/gostudio.sh
+/HBpersistence/dev/bin/gostudio
 ```
 
-The launcher retires any probe still holding the layer; resolves the PIDs of `PCM3Root` and `PCM3Reload` with `pidin` into `/tmp/p3pid` and `/tmp/rlpid` (**never hard-code PIDs** — a stale one silently reads another process); clears the previous run's switches and log; and launches with all three standard streams redirected: `on -d /HBpersistence/dev/bin/studio </dev/null >/dev/null 2>/dev/null`. The redirection is mandatory — the graphics library prints to stdout on connect, and with an undrained console that single write blocks the process forever and looks exactly like "the gf call hangs" (Trap ①).
+`gostudio` is the **only** supported way to start it. It resolves the PIDs of `PCM3Root` and `PCM3Reload` with `pidin` into `/tmp/p3pid` and `/tmp/rlpid` (**never hard-code PIDs** — a stale one silently reads another process; `/tmp` is cleared on every boot, and the stock autostart hook writes only `p3pid`, so a studio started any other way comes up half-blind with page id stuck at −1); **refuses to start if a studio is already running**; clears `/tmp/studio.stop`; takes an optional mode argument (`gostudio 2` for mirror mode); and launches with all three standard streams redirected: `on -d /HBpersistence/dev/bin/studio </dev/null >/dev/null 2>/dev/null`. The redirection is mandatory — the graphics library prints to stdout on connect, and with an undrained console that single write blocks the process forever and looks exactly like "the gf call hangs" (Trap ①).
 
 Startup mode comes from `/tmp/studio_mode`, re-read **every tick** from the main loop (`main_pcm.c:198`, `plat_pcm.c:178-185`); read inside `plat_present()` it would never run once the screen goes idle, because the shell only presents when dirty. Mode `0` (default) is a self-test image — corner primaries, white border, moving square, which proves layer, colour channels and geometry before you debug content. Mode `1` is the real UI. Mode `2` is mirror mode: it reads stock state and logs it but **does not take the screen**, so you can watch the stock UI while calibrating page ids and sources.
 
@@ -178,6 +191,8 @@ echo x > /tmp/studio.stop          # stop (bench ksh has no `touch`)
 | Line | Meaning | Source |
 |---|---|---|
 | `自校验 ck=0x… size=…` | must equal the `ck` from your build (§2.2) | `main_pcm.c:110` |
+| `[自检] 防绿屏闸门有效 ✓` | every boot deliberately fakes "first frame not ready" and checks the gate refuses to light the layer. If this line is missing or says otherwise, the anti-green-screen guard is gone | `plat_pcm.c`, `plat_init()` |
+| `[层] 首帧还没就位, 拒绝点亮(防绿屏)` | the same gate firing for real — expected once during takeover, not repeatedly | `push_layer()` |
 | `字库已加载 … 字节, … 字形  <- …` | which font file won the candidate race | `main_pcm.c:86-87` |
 | `display 800x480  nlayers=…` | display attached | `plat_pcm.c:389-390` |
 | `gf_layer_attach(1,PASSIVE) r=0` | got the layer | `plat_pcm.c:396-397` |

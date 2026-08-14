@@ -217,7 +217,10 @@ static int shell_tick(void){
           if(last_anim == 0 || n2 - last_anim >= (unsigned)iv){ last_anim = n2; g_dirty = 1; }
       } else last_anim = 0; }
     /* 音量变化自动弹音量条 —— 系统级行为, 任何场景都有 */
-    if(have_last && st.volume != last_st.volume) shell_gauge(st.volume, 40, st.muted?2:1);
+    /* 🚫 **音量不再弹层**(2026-08-14)。弹层活着 ⇒ in_anim ⇒ 局部重绘被禁 ⇒ 整页重画,
+     *   而且持续 1.66 秒 —— 台架上表现为"拧音量画面会跳"。
+     *   音量现在画在各页的状态栏里(shell_draw_status), 拧一下 = 一次普通状态变化 = 重画一帧。
+     *   ⚠️ 上面那段"状态变了就重画"里已经含 st.volume, 所以去掉弹层不影响刷新。 */
     last_st = st; have_last = 1;
 
     /* 3. 画。动画期间(转场/弹层)必须每帧画, 不能等 dirty */
