@@ -10,7 +10,7 @@
 #define STUDIO_FONT_EXTERNAL
 #include "platform/plat_pcm.c"
 #include "scenes/scene_btplay.c"
-#include "scenes/scene_home.c"
+#include "scenes/scene_source.c"
 #include "scenes/scene_radio.c"
 #include "scenes/scene_settings.c"
 #include "scenes/scene_aux.c"
@@ -111,15 +111,22 @@ static void self_ck(void){
 }
 
 int main(void){
+    /* 🔒 **必须是第一句** —— 早于 self_ck(), 因为 plat_log 首写带 O_TRUNC:
+     *   放晚一拍, 被拒的第二个实例也已经把第一个实例的日志(含自校验 ck)抹掉了。
+     *   理由和陈旧锁的判活方式都写在 plat_pcm.c 的 plat_claim_singleton() 上面。 */
+    if(plat_claim_singleton() != 0) return 1;
     self_ck();
     load_font();
-    if(plat_init() != 0){ plat_log("平台起不来, 空转\n"); for(;;) usleep(5000000); }
-    shell_register(&SCENE_HOME);
+    /* -2 = 单实例锁不在手里(结构性错误, 空转只会掩盖它); 其余 = 硬件起不来, 空转等人来看日志。 */
+    { int r = plat_init();
+      if(r == -2){ plat_log("平台拒绝启动 -> 退出\n"); return 1; }
+      if(r != 0){ plat_log("平台起不来, 空转\n"); for(;;) usleep(5000000); } }
+    shell_register(&SCENE_SOURCE);
     shell_register(&SCENE_BTPLAY);
     shell_register(&SCENE_RADIO);
     shell_register(&SCENE_SETTINGS);
     shell_register(&SCENE_AUX);
-    shell_goto("home");
+    shell_goto("source");
     plat_log("外壳启动, 进主循环  (停止: touch /tmp/studio.stop, **别 slay**)\n");
     for(;;){
         /* 🚨 必须有优雅退出: 被 kill 的话我们最后一帧会**永久冻在屏上**(gdc 不归还层),
@@ -183,15 +190,29 @@ int main(void){
             static int last_page = -1;
             PcmState ps; plat_read_state(&ps);
             if(ps.stock_page != last_page && ps.stock_page >= 0){
-                int owned = 1;
+                /* 🔑 **"谁显示"只在这一处决定。** 场景点了卡片只负责真切源(CMD_SET_SOURCE),
+                 *   原厂自己走完后续并切它的页, 页 id 一变就走到这里。
+                 *   两边各判一次的话迟早打架, 而且"为什么这页是原厂的"会变得没人说得清。
+                 *
+                 * 🔀 接管开关**每次现查**(plat_cfg_get), 不缓存 ⇒ 设置页一拨就生效,
+                 *   不用等下次切页。用户 2026-08-14 明确要求"最好当场生效"。
+                 *
+                 * ⚠️ 387 的注释以前写的是"音源页" —— **错的**, 台架实证它是 **AUX 页**
+                 *   (按 MEDIA 切到 AUX 时页 id 就是 387)。原厂的 SOURCE 是**浮窗**,
+                 *   根本不改页 id, 所以"音源页"这个页 id 压根不存在。
+                 *   我们的音源页由 SOURCE **硬键**驱动(pcm_shell 里截), 不走页 id 路由。 */
+                const char *go = 0;
+                int cfg = -1;
                 last_page = ps.stock_page;
                 switch(ps.stock_page){
-                    case 855: case 873: shell_goto("radio");  break;   /* FM 主页 / 电台列表 */
-                    case 375:           shell_goto("btplay"); break;   /* 蓝牙播放页 */
-                    case 387:           shell_goto("home");   break;   /* 音源页 -> 我们的首页 */
-                    default:            owned = 0;            break;   /* 没见过 -> 交还原厂 */
+                    case 855: case 873: go = "radio";  cfg = CFG_TAKEOVER_FM;  break; /* FM 主页 / 电台列表 */
+                    case 375:           go = "btplay"; cfg = CFG_TAKEOVER_BT;  break; /* 蓝牙播放页 */
+                    case 387:           go = "aux";    cfg = CFG_TAKEOVER_AUX; break; /* AUX 页 */
+                    default:            break;         /* 没见过的页 -> 一律交还原厂 */
                 }
-                set_cover(owned);
+                { int owned = (go && plat_cfg_get(cfg));
+                  if(owned) shell_goto(go);
+                  set_cover(owned); }
             }
         }
 scene_done:

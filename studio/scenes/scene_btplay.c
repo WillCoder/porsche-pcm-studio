@@ -700,13 +700,90 @@ static int ctl_hit(int x, int y){
     return -1;
 }
 
+
+/* ================= 等待连接页 =================
+ * 🚨 为什么单独做一个: 没有曲目时, 播放页会退化成"标题位一根灰条 + 两行空白 +
+ *   空进度条配 00:00/--:-- + 五个按不动的键"。那看着**不是"在等连接", 是"这页坏了"**。
+ *   而且五个死按钮会招人去按 —— 按了没反应比压根没有更糟。
+ * ⇒ 没曲目时整页换成为等待设计的样子: 隐藏进度条/时间/传输键, 唱片保持静止,
+ *   文案说清**现在该做什么**。
+ *
+ * 🔑 三种"没曲目"必须分开, 它们以前长得一模一样, 用户无从判断该干嘛:
+ *   A 没手机连上          -> 去手机上连
+ *   B 连上了但没在放       -> 显示设备名, 等就行
+ *   C 手机在放但**车机音源不是蓝牙** -> 去切音源
+ *   C 真发生过: 手机在放、页面一片空白, 查半天发现主机音源停在 FM。 */
+#define STOCK_SLOT_BT  40           /* 原厂音源槽号: FM=11 AUX=26 BT=40 */
+
+/* 这一拍该画播放页还是等待页 —— 判据只有一处, 三个回调都用它,
+ * 免得 render 走等待页而 anim_ms/anim_rect 还按播放页算(那会白刷 12fps)。 */
+static int bt_has_track(const PcmState *st){ return st->title[0] != 0; }
+
+enum { BTW_NO_DEVICE = 0, BTW_IDLE, BTW_WRONG_SOURCE };
+
+/* 没曲目时该显示哪一种。有曲目就不该调它。 */
+static int bt_wait_kind(const PcmState *st){
+    /* 槽号读得到、且明确不是蓝牙 ⇒ 音源不对。-1 = 还没读到, 不算数。 */
+    if(st->stock_src_slot > 0 && st->stock_src_slot != STOCK_SLOT_BT) return BTW_WRONG_SOURCE;
+    if(!st->device[0]) return BTW_NO_DEVICE;
+    return BTW_IDLE;
+}
+
+static void render_bt_waiting(const PcmState *st, unsigned t_ms){
+    const char *head, *sub;
+    gfx_backdrop(11,14,20, 23,29,41, 180, 140, 330, 58,120,190, 120);
+    /* 唱片**恒定静止**。不能直接把 st 传下去 —— 状态 C 里 play_state 是 PLAYING(手机确实在放),
+     * 唱片就会转; 而这一页的意思是"我们这儿没有可放的东西", 转着是误导。
+     * 造一份 play_state 清零的副本, 只用来画砖。 */
+    {   PcmState still = *st;
+        still.play_state = PLAY_PAUSED;
+        draw_v1_tile(&still, t_ms);
+    }
+
+    /* 刊头只留蓝牙标 + 时钟/电量。设备名挪到正文去当主角。 */
+    {   char buf[16]; int tw = 0, h, m;
+        if(pcm_clock(st, &h, &m)){
+            buf[0]=(char)('0'+h/10); buf[1]=(char)('0'+h%10); buf[2]=':';
+            buf[3]=(char)('0'+m/10); buf[4]=(char)('0'+m%10); buf[5]=0;
+            tw = gfx_text_w(buf,1);
+            text_base(760 - tw, 74, buf, 1, C_MICRO);
+        }
+        draw_bt_mark(V1_COL_X + 8, 65, 8, C_MICRO, 255);
+        text_base(V1_COL_X + 28, 74, T(STR_BLUETOOTH), 1, C_MICRO);
+        { int lv; if(pcm_battery(st, &lv)) draw_battery((tw ? 760 - tw - 18 : 760) - 26, 55, lv); }
+    }
+
+    switch(bt_wait_kind(st)){
+        case BTW_WRONG_SOURCE:
+            head = T(STR_BT_WRONG);
+            sub  = T(STR_BT_WRONG2);
+            break;
+        case BTW_IDLE:
+            head = st->device[0] ? st->device : T(STR_CONNECTED);
+            sub  = T(STR_BT_IDLE);
+            break;
+        default:
+            head = T(STR_BT_CONNECT);
+            sub  = T(STR_BT_CONNECT2);
+            break;
+    }
+    /* 主行用 36px(和曲名同一档 sc16=24), 让两个状态之间不跳版式 */
+    /* 📐 对着砖的竖向中心(240)排, 不沿用播放页的 186/228 ——
+     *   播放页下面还有专辑行/进度条/控件把版面压住, 等待页什么都没有,
+     *   照抄那两个基线就会上重下空, 又是"没画完"的样子。
+     *   两行墨迹 218..276, 中心 247 ≈ 砖心 240, 视觉上就平了。 */
+    text_base_lim_s(V1_COL_X, 238, head, 24, V1_COL_W, C_DISPLAY);
+    text_base_lim (V1_COL_X, 276, sub,  1,  V1_COL_W, C_MICRO);
+    /* 🚫 这里**故意不画**进度条、时间、传输键 —— 没有可控的东西, 就不摆能按的东西。 */
+}
+
 static void render_v1_plus(const PcmState *st, unsigned t_ms){
     char buf[64];
     int ts, w2_;
     gfx_backdrop(11,14,20, 23,29,41, 180, 140, 330, 58,120,190, 120);
     draw_v1_tile(st, t_ms);
     /* 右栏顶: 蓝牙标 + 真设备名 + 电量 + 时钟 */
-    {   const char *dev = st->device[0] ? st->device : "蓝牙";
+    {   const char *dev = st->device[0] ? st->device : T(STR_BLUETOOTH);
         int tw = 0, h, m;
         if(pcm_clock(st, &h, &m)){        /* 拿不到就整个不画 —— 访问器强制你处理这个分支 */
             buf[0]=(char)('0'+h/10); buf[1]=(char)('0'+h%10); buf[2]=':';
@@ -766,7 +843,10 @@ static void render_v1_plus(const PcmState *st, unsigned t_ms){
 
 static void btplay_render(u16_ *fb, const PcmState *st, unsigned t_ms){
     gfx_target(fb);
-    render_v1_plus(st, t_ms);
+    /* 有曲目 = 播放页; 没曲目 = 等待页。判据用**曲名**而不是 play_state ——
+     * 暂停在半首歌上仍然该显示完整播放页(只是唱片停转), 那不是"等待"。 */
+    if(bt_has_track(st)) render_v1_plus(st, t_ms);
+    else                 render_bt_waiting(st, t_ms);
 }
 
 static int btplay_event(const PcmEvent *ev, const PcmState *st){
@@ -811,6 +891,11 @@ static int btplay_event(const PcmEvent *ev, const PcmState *st){
  * 不给它一个节拍的话, 暂停态下光晕会**永久留在屏上**。
  * 50ms 比 PRESS_MIN_MS(120) 短, 保证按下那一帧一定画得出来、也一定熄得掉。 */
 static int btplay_anim_ms(const PcmState *st){
+    /* 🚨 等待页**没有任何东西会动** —— 唱片是强制静止的, 没有进度条也没有传输键。
+     *   不加这一条的话: 状态 C 里 play_state 是 PLAYING(手机确实在放),
+     *   定时器照常 12.5fps 触发, 每秒白重画 12 次一个静止页面。
+     *   动画由**画面上有没有动的东西**决定, 不是由播放状态决定。 */
+    if(!bt_has_track(st)) return press_active() ? 50 : 0;
     /* 🚨 按下光晕期间必须有重画 —— 熄灭逻辑(press_active)只在渲染时才跑,
      *   不给节拍的话暂停态下光晕会**永久留在屏上**。50ms < PRESS_MIN_MS(120)。 */
     if(press_active()) return 50;
@@ -847,6 +932,9 @@ static int btplay_anim_rect(const PcmState *st, int *x0, int *y0, int *x1, int *
     static int last_drawn_s = -1;
     int now_s = st->pos_ms / 1000;
     if(press_active()) return 0;
+    /* 等待页没有局部动画区 —— 返回 0 让外壳走整页(它本来也极少重画)。
+     * 不返回 0 的话, 脏矩形是**播放页**那块, 会在等待页上反复刷一块空背景。 */
+    if(!bt_has_track(st)) return 0;
     *x0 = VIN_CX - VIN_R - 3;  *x1 = VIN_CX + VIN_R + 3;
     *y0 = VIN_CY - VIN_R - 3;  *y1 = VIN_CY + VIN_R + 3;
     if(now_s != last_drawn_s){
@@ -905,7 +993,7 @@ static void btplay_enter(void){
 }
 
 static const PcmScene SCENE_BTPLAY = {
-    "btplay", "蓝牙播放", btplay_enter, 0, btplay_render, btplay_event, btplay_anim_ms, btplay_anim_rect
+    "btplay", STR_BT_TITLE, btplay_enter, 0, btplay_render, btplay_event, btplay_anim_ms, btplay_anim_rect
 };
 
 #endif /* SCENE_BTPLAY_C */

@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include "platform/plat_mac.c"
 #include "scenes/scene_btplay.c"
-#include "scenes/scene_home.c"
+#include "scenes/scene_source.c"
 #include "scenes/scene_radio.c"
 #include "scenes/scene_settings.c"
 #include "scenes/scene_aux.c"
@@ -39,13 +39,13 @@ static void mac_load_font(void){
 int main(void){
     if(plat_init() != 0) return 1;
     mac_load_font();
-    shell_register(&SCENE_HOME);
+    shell_register(&SCENE_SOURCE);
     shell_register(&SCENE_BTPLAY);
     shell_register(&SCENE_RADIO);
     shell_register(&SCENE_SETTINGS);
     shell_register(&SCENE_AUX);
     { const char *sc = getenv("STUDIO_SCENE");   /* 预览用: STUDIO_SCENE=btplay 直接停在那一页 */
-      shell_goto(sc && *sc ? sc : "home"); }
+      shell_goto(sc && *sc ? sc : "source"); }
     for(;;){
         shell_tick();
         usleep(33000);          /* ~30fps 上限; 只有 dirty 才真画 */

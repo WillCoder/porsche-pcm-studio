@@ -60,6 +60,20 @@ extern int  write(int fd, const void *b, unsigned n);
 extern int  close(int fd);
 extern long lseek(int fd, long o, int w);
 extern int  usleep(unsigned us);
+extern int  getpid(void);
+/* ⚠️ **不要往这个列表里随手加 libc 函数。**
+ *   我们链接的是桩库(dev/sh4tools/stub_libc.c), 它里面全是假实现 ——
+ *   桩里有、真机上没有的符号**编译期一个字都不报**, 上机是加载失败、日志空白
+ *   ("毛都没看到"), 每次都要搭进去一趟 U 盘。加之前先确认真机上有人提供。
+ *
+ * 🚨 2026-08-14 未结: 我试图用"查 libc.so.2 的动态字符串表"来当这个判据,
+ *   **它自证不可信** —— 同一张表里 `open`/`read`/`write`/`close`/`devctl` 全都查不到,
+ *   而这几个正是本程序天天在用、在台架上跑得好好的。所以那张表不是权威,
+ *   由它得出的"某某符号不存在"一律不作数(我一度据此断言 libc 没有 unlink, 撤回)。
+ *   工具留在 studio/tools/check_syms.py, 但**没有接进构建**, 原因写在它文件头。
+ *   ⇒ 现在唯一可信的判据还是: **在台架上真跑一次**。
+ *   (顺带一条判据教训: 裸字节搜 "unlink" 会搜到 `mq_unlink` 的子串。
+ *    判符号在不在至少要匹配 `\0名字\0` —— 虽然那也不够。) */
 /* 信号: studio 自己声明(不用系统头)。**号码抄自隔壁 coexist_pop.c** ——
  * 那份在这台机器上实际用过并生效, 比我按 POSIX 猜可靠。 */
 #define SIGHUP 1
@@ -83,6 +97,29 @@ extern int  clock_gettime(int id, void *ts);
 #define LM_CHECKVER 0xc00c0506u
 
 #define LOGPATH "/tmp/studio.log"
+
+/* ============ 音源三套编号只准有一张表 ============
+ * 🚨 2026-08-14 抓到的真 bug: 老的 scene_home.c 写的是 `plat_command(CMD_SET_SOURCE, c->src)`,
+ *   传进去的是 `SRC_BT`(=1); 而 CMD_SET_SOURCE 当时要的是**原厂槽号**(BT=40)。
+ *   编译零警告 —— 两边都是 int, 谁也拦不住。同一个概念("哪个音源")有**三套编号**
+ *   (我们的 SRC_*、原厂槽 slot、原厂 app), 却散在三处各写各的。
+ * ⇒ 收成一张表, 正反查都走它。要加音源只改这一处, 结构上不可能再对不齐。
+ * 数字全部来自 2026-08-05 台架"按一次对一次"的实证, 不是推测:
+ *   FM=(slot 11, app 1)  AUX=(26, 6)  蓝牙=(40, 7)
+ * ⚠️ app 比 slot 稳(slot 起始出现过 13, 而 app 恒定), 所以**反查用 app**。 */
+typedef struct { int src; int slot; int app; const char *name; } SrcRow;
+static const SrcRow SRCTAB[] = {
+    { SRC_FM,  11, 1, "FM"  },
+    { SRC_AUX, 26, 6, "AUX" },
+    { SRC_BT,  40, 7, "BT"  },
+};
+#define SRCTAB_N ((int)(sizeof SRCTAB / sizeof SRCTAB[0]))
+/* SRC_* -> 原厂槽号。0 = 表里没有 ⇒ 这个音源我们不会切。 */
+static int src_to_slot(int src){
+    int i;
+    for(i = 0; i < SRCTAB_N; i++) if(SRCTAB[i].src == src) return SRCTAB[i].slot;
+    return 0;
+}
 #define PIDFILE "/tmp/p3pid"
 
 /* ================= 日志 ================= */
@@ -109,6 +146,69 @@ static unsigned p_now_raw(void){
     return ts[0]*1000u + ts[1]/1000000u;
 }
 unsigned plat_now_ms(void){ return p_now_raw() - g_t0; }
+
+#define CFG_PATH "/HBpersistence/dev/etc/studio.conf"
+
+/* ================= 设置持久化 =================
+ * 格式: 一行一项 `key=0|1`, 认不出的键直接忽略(向前兼容: 老版本读新文件不会炸)。
+ * 文件不存在 = 用默认值, 不是错误 —— 第一次跑本来就没有。
+ * 🚨 set 立刻落盘。攒着不写的话, 一次断电就把用户的设置吞了, 而车机断电是常态。 */
+static const char *g_cfg_key[CFG_N] = { "takeover.bt", "takeover.fm", "takeover.aux", "lang" };
+/* 语言默认 0 = LANG_EN(英文)。改这个默认值等于改所有新用户的第一印象, 想清楚再动。 */
+static const int   g_cfg_def[CFG_N] = {  1,             0,             0,              0     };
+static int  g_cfg[CFG_N];
+static int  g_cfg_loaded = 0;
+
+static void cfg_load(void){
+    int fd, n, i, k;
+    char b[512];
+    for(i = 0; i < CFG_N; i++) g_cfg[i] = g_cfg_def[i];
+    g_cfg_loaded = 1;
+    fd = open(CFG_PATH, O_RDONLY, 0);
+    if(fd < 0) return;                       /* 没有文件 = 用默认值 */
+    n = (int)read(fd, b, sizeof b - 1);
+    close(fd);
+    if(n <= 0) return;
+    b[n] = 0;
+    for(i = 0; i < n; ){
+        int ls = i, eq = -1, j;
+        while(i < n && b[i] != '\n') { if(b[i] == '=' && eq < 0) eq = i; i++; }
+        if(i < n) b[i++] = 0; else b[n] = 0;
+        if(eq < 0) continue;
+        b[eq] = 0;
+        for(k = 0; k < CFG_N; k++){
+            const char *a = g_cfg_key[k], *c = b + ls;
+            for(j = 0; a[j] && c[j] && a[j] == c[j]; j++);
+            if(!a[j] && !c[j]){ char d = b[eq+1];
+                /* 认一位十进制数字(0..9), 不再只认 '1' —— 语言这类多值键要用。
+                 * 非数字一律当 0, 别把坏文件解释成某个意外的值。 */
+                g_cfg[k] = (d >= '0' && d <= '9') ? (d - '0') : 0; break; }
+        }
+    }
+}
+static void cfg_save(void){
+    char b[512]; int p = 0, i, fd;
+    for(i = 0; i < CFG_N; i++){
+        const char *k = g_cfg_key[i]; int j;
+        for(j = 0; k[j] && p < (int)sizeof b - 4; j++) b[p++] = k[j];
+        b[p++] = '='; b[p++] = (char)('0' + (g_cfg[i] % 10)); b[p++] = '\n';
+    }
+    fd = open(CFG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if(fd < 0){ plat_log("⚠ 设置存不下来: "); plat_log(CFG_PATH); plat_log("\n"); return; }
+    write(fd, b, (unsigned)p);
+    close(fd);
+}
+int plat_cfg_get(int key){
+    if(!g_cfg_loaded) cfg_load();
+    return (key >= 0 && key < CFG_N) ? g_cfg[key] : 0;
+}
+void plat_cfg_set(int key, int val){
+    if(!g_cfg_loaded) cfg_load();
+    if(key < 0 || key >= CFG_N) return;
+    g_cfg[key] = (val < 0 || val > 9) ? 0 : val;   /* 钳死: 坏值宁可回默认, 别写进文件 */
+    cfg_save();
+}
+
 
 /* ================= 显示: 独立 gf 层 ================= */
 static gf_dev_t     g_dev   = 0;
@@ -346,9 +446,28 @@ static unsigned char g_alphablk[64];    /* 全零 gf_alpha_t: mode=0, 在驱动 
  *   有了开关才能在同一次上机里测出 "旧=非0 / 新=0" 的对照。 */
 static unsigned g_reassert_flip = 0;    /* 重申**改变了**前台的次数 = bug 复现计数 */
 static int      g_oldfront = 0;         /* 1 = 用旧行为(仅诊断) */
-static void push_layer(void){
+/* 前置声明: 这两个状态定义在"覆盖/让开"那一节, 但下面这道闸门要用。 */
+static int g_cover, g_shown, g_push_ok;
+
+/* 🔒🔒 **不变式: 首帧没就位, 层就不许亮。**
+ * 2026-08-14 台架实测的病: 接管时立刻 enable, 而新一帧要 198ms 才到位 ——
+ * 这 198ms 层在扫**我们让开期间被原厂改过**的显存, 按 RGBA5551 解释出来是绿的花屏。
+ *
+ * 【为什么闸门做在这儿, 而不是"记得别在 set_cover 里 push"】
+ * 点亮层的路不止一条(set_cover / 退出镜像模式 / 每秒周期重申 / 以后新加的),
+ * 每条都靠人记得判一次 ⇒ 一定有漏的, 而漏了的症状是"偶尔闪一下绿",
+ * 最难复现也最难归因。**放在唯一的出口上, 谁都绕不过去。**
+ * 🚑 确实需要"哪怕帧没准备好也要亮"的地方(兜底强推)把 g_push_ok 置 1 —— 显式、可搜索。 */
+/* 返回 1 = 真的点亮了; 0 = 被闸门拦下(或者层还没建好)。
+ * **有返回值是为了能自检** —— 没有它, "闸门还在不在"只能靠读代码, 而那正是这条
+ * 不变式最容易被以后某次改动悄悄拆掉的方式。 */
+static int push_layer(void){
     gf_surface_t cur;
-    if(!g_layer || !g_surf) return;
+    if(!g_layer || !g_surf) return 0;
+    if(g_cover && !g_shown && !g_push_ok){
+        plat_log("[层] 首帧还没就位, 拒绝点亮(防绿屏)\n");
+        return 0;
+    }
     cur = (g_front && !g_oldfront) ? g_front : g_surf;
     if(g_front && cur != g_front) g_reassert_flip++;
     gf_layer_set_surfaces(g_layer, &cur, 1);
@@ -362,6 +481,101 @@ static void push_layer(void){
     gf_layer_enable(g_layer);
     gf_layer_update(g_layer, 0);
     g_front = cur;          /* 维护不变量: g_front 永远 = 当前真正在前台的那块 */
+    return 1;
+}
+
+/* ============ 不变式: 一个硬件层只能有一个 studio ============
+ * 🚨 2026-08-14 台架实地踩到: 机器上同时跑着两个 studio。后果不是"慢一点", 是**归因失效**:
+ *   ① 两个都在读 /tmp/studio_post —— 谁先跑到谁把命令吃掉并 O_TRUNC, 另一个永远收不到。
+ *      我发的差分快照命令就是这么消失的(文件被清空 = 看起来"投递成功", 日志里却没有回应)。
+ *   ② 两个都往 /tmp/studio.log 写, 后起的那个 O_TRUNC 把前一个的启动日志抹掉。
+ *   ③ 两个抢同一个 gf 层: 后起的 `[清残留] disable+update` 直接把前一个的层掀了,
+ *      前一个之后再调 gf 就 REPLY-block 死在 gdcServerCarmine 上 —— 只能断电。
+ *   ④ 最阴的: 旧进程跑的是**旧二进制**(文件被覆盖不影响已映射的代码),
+ *      于是"我推了新版"和"机器在跑新版"是两回事 —— 这正是 KB 里那条陈旧进程的坑。
+ *
+ * 【为什么放在这里, 而不是靠"记得先 stop"】
+ *   靠人记 = 一定有忘的时候, 而忘了的那次症状是上面这些, 每一个都指向别处。
+ *   这条不变式的**执行机构就是抢层的这段代码**: 谁抢层谁负责保证只有一个,
+ *   所以锁在 plat_init 里拿、在 plat_shutdown 里还, 跟层的生命周期完全同步。
+ *
+ * 【陈旧锁怎么办】崩溃/断电会留下锁文件。判活不用 kill()(桩 libc 里没有, 而且信号
+ *   本身就是我们最想避开的东西), 用 `/proc/<pid>/as` 能不能打开 —— 跟引擎读原厂状态
+ *   同一条路, 不引入新机制。打不开 = 那个 pid 没了 = 锁是陈旧的, 直接接管。 */
+#define LOCKPATH "/tmp/studio.lock"
+
+/* 拼 "/proc/<pid>/as" 并试着打开。>=0 = 那个 pid 还活着(fd 由调用方关)。 */
+static int proc_as_open(int pid){
+    char p[40]; const char *a="/proc/", *b="/as";
+    char num[12], t[12]; int i=0,j,k=0,n=0;
+    if(pid <= 0) return -1;
+    while(a[i]){ p[i]=a[i]; i++; }
+    { int q=pid; while(q){ t[k++]=(char)('0'+q%10); q/=10; } while(k) num[n++]=t[--k]; }
+    for(j=0;j<n;j++) p[i++]=num[j];
+    j=0; while(b[j]) p[i++]=b[j++]; p[i]=0;
+    return open(p, O_RDONLY, 0);
+}
+/* 返回 0 = 锁到手; -1 = 已经有一个活着的 studio。
+ * 🚨 **必须在任何 plat_log 之前调用**(main 的第一句), 不能等到 plat_init:
+ *   plat_log 首写带 O_TRUNC, 而 self_ck/load_font 在 plat_init 之前就打日志了 ——
+ *   放晚一拍的话, 第二个实例哪怕被拒, 也已经把第一个实例的启动日志(含自校验 ck)抹掉了,
+ *   而 ck 正是"机器在跑哪一版"的唯一证据。锁保护的不只是 gf 层, 还有日志和命令文件。
+ *   所以被拒的那条消息是 **append** 上去的, 紧跟在活着那个实例的日志后面。 */
+int plat_claim_singleton(void){
+    int fd, n, pid = 0, i;
+    char b[16];
+    fd = open(LOCKPATH, O_RDONLY, 0);
+    if(fd >= 0){
+        n = read(fd, b, 15); close(fd);
+        if(n > 0){ for(i=0; i<n && b[i]>='0' && b[i]<='9'; i++) pid = pid*10 + (b[i]-'0'); }
+        if(pid > 0){
+            int as = proc_as_open(pid);
+            if(as >= 0){                       /* 那个 pid 还在 -> 真的有另一个实例 */
+                close(as);
+                /* 🚨 **必须先关掉首写截断**。2026-08-14 台架上当场证伪抓到:
+                 *   我把 claim 提到了 main 第一句, 以为这样就保住了在跑那个实例的日志 ——
+                 *   但 plat_log 的截断是**按进程**的, 这句抱怨正是本进程的第一次 plat_log,
+                 *   照样 O_TRUNC, 于是活着那个实例的启动日志(含锚点地址和 ck)还是没了。
+                 *   ⇒ 被拒的实例只许**追加**, 一个字节都不许截。 */
+                g_logfirst = 0;
+                plat_log("‼️ 已经有一个 studio 在跑 (pid="); p_logd(pid);
+                plat_log("), 拒绝启动。\n   停它: touch /tmp/studio.stop  (**别 slay**)\n");
+                return -1;
+            }
+            plat_log("[单实例] 发现陈旧锁 pid="); p_logd(pid);
+            plat_log(" (进程已不在), 接管\n");
+        }
+    }
+    fd = open(LOCKPATH, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if(fd < 0){ plat_log("[单实例] ⚠ 锁文件写不了, 只能不设防继续\n"); return 0; }
+    { int q = getpid(); char t[12]; int k=0, w=0; char o[13];
+      if(!q) t[k++]='0'; else while(q){ t[k++]=(char)('0'+q%10); q/=10; }
+      while(k) o[w++]=t[--k]; o[w++]='\n';
+      write(fd, o, (unsigned)w); }
+    close(fd);
+    return 0;
+}
+/* 放锁 = 把锁文件**清空**, 不是删。
+ * 理由不是"libc 没有 unlink"(那条断言我撤回了, 见文件顶部 extern 那段) ——
+ * 而是**清空不需要任何新符号**, 只用 open/close 这两个本程序天天在跑、已经被硬件验过的调用。
+ * 在"桩库会遮住真库缺什么"这个前提下, 不新增外部依赖本身就是最便宜的确定性。
+ * 空文件在 claim 里读出 n==0 ⇒ pid 保持 0 ⇒ 走"没有有效 pid"这条路直接接管, 语义一致。 */
+static void release_singleton(void){
+    int fd = open(LOCKPATH, O_WRONLY|O_TRUNC, 0644);
+    if(fd >= 0) close(fd);
+}
+
+/* 防守断言: 抢层之前复核锁真在我们手里。
+ * 🚨 这不是多余的 —— 它拦的是"以后有人给 main 加了一句、把 claim 挤到 plat_init 之后"
+ *   这种改法。锁和层必须同生共死, 结构上就别给"忘了调 claim"留口子。 */
+static int lock_is_ours(void){
+    int fd, n, pid = 0, i; char b[16];
+    fd = open(LOCKPATH, O_RDONLY, 0);
+    if(fd < 0) return 0;
+    n = read(fd, b, 15); close(fd);
+    if(n <= 0) return 0;
+    for(i=0; i<n && b[i]>='0' && b[i]<='9'; i++) pid = pid*10 + (b[i]-'0');
+    return pid == getpid();
 }
 
 int plat_init(void){
@@ -373,6 +587,13 @@ int plat_init(void){
 
     g_t0 = p_now_raw();
     plat_log("=== PCM Studio (真机后端) ===\n");
+
+    /* 🔒 抢层之前复核锁在我们手里(claim 本身在 main 第一句, 见 plat_claim_singleton 的说明)。 */
+    if(!lock_is_ours()){
+        plat_log("‼️ 单实例锁不在我们手里 -> 拒绝抢层。"
+                 "(main 里 plat_claim_singleton() 必须是第一句)\n");
+        return -2;
+    }
 
     /* 1. LM CHECKVER 握手 —— 不做这步 gf_dev_attach 会阻塞死 */
     lmfd = open(LM_DEV, LM_FLAGS, 0);
@@ -474,6 +695,20 @@ int plat_init(void){
     plat_log(g_wide ? "[上屏] 宽路径 u32\n" : "[上屏] ⚠对齐不满足 -> 退回 u16 窄路径\n");
     push_layer();
     plat_log("首次推送完成(含 set_blending 复位) 层="); p_logd(g_lidx); plat_log("\n");
+
+    /* ============ 开机自检: 防绿屏闸门还活着吗 ============
+     * 🚨 用户 2026-08-14 要求把"先写帧再点亮"这条固化下来。而**只写注释是拦不住的** ——
+     *   点亮层的路不止一条, 以后任何一次改动都可能在别处补一句 push_layer()。
+     * ⇒ 每次开机故意造一次"首帧未就位"的状态, 看闸门拦不拦得住。
+     *   拦住了打 ✓; 没拦住**当场喊出来**。这样"守卫被拆掉"这件事不会等到用户
+     *   在车上看见一段绿屏才被发现。
+     * 零风险: 只在这一拍把 g_shown 临时置 0, 立刻还原, 不碰任何硬件状态。 */
+    {   int keep = g_shown;
+        g_shown = 0;
+        if(push_layer()) plat_log("‼️ [自检] 防绿屏闸门失效: 首帧未就位时竟然点亮了\n");
+        else             plat_log("[自检] 防绿屏闸门有效 ✓(接管时先写帧再点亮)\n");
+        g_shown = keep;
+    }
     g_last_reassert = plat_now_ms();
     if(read_layer_fp(&g_fp_fmt, &g_fp_sz)){
         plat_log("[让出协议] 已就绪 hw L"); p_logd(g_hwidx);
@@ -501,12 +736,18 @@ void plat_shutdown(void){
      * 但正常退出走这条更干净 —— 双保险。同样必须在 `if(!g_layer) return` 之前。 */
     if(g_ev_on) mme_reg_events(0);
     plat_puppet_park();          /* studio 走了就别留着武装态 —— LEVEL=0 = cave 惰性 */
-    if(!g_layer) return;
-    { int i; for(i=0;i<64;i++) g_alphablk[i]=0; }
-    gf_layer_set_blending(g_layer,(gf_alpha_t*)g_alphablk);  /* 别把混合绑定留给下一个人 */
-    gf_layer_disable(g_layer);
-    gf_layer_update(g_layer, 0);                             /* 只有 disable+update 才真关 */
-    plat_log("[退出] 已复位混合 + disable+update 真归还层\n");
+    if(g_layer){
+        { int i; for(i=0;i<64;i++) g_alphablk[i]=0; }
+        gf_layer_set_blending(g_layer,(gf_alpha_t*)g_alphablk);  /* 别把混合绑定留给下一个人 */
+        gf_layer_disable(g_layer);
+        gf_layer_update(g_layer, 0);                             /* 只有 disable+update 才真关 */
+        plat_log("[退出] 已复位混合 + disable+update 真归还层\n");
+    }
+    /* 🔒 锁**最后**才放, 而且 g_layer==0(init 半路失败)这条路也必须放到 ——
+     *   早放会开一个窗口: 我们还在 disable 的时候另一个实例已经把层抢走了。
+     *   (这里以前是 `if(!g_layer) return;` 提前返回, 那条路会把锁留死。
+     *    留死的锁下次启动会被判成陈旧锁接管, 能自愈 —— 但"能自愈"不是不修的理由。) */
+    release_singleton();
 }
 /* 🚨🚨 让出协议必须**主循环每拍**跑, 不能挂在 plat_present 里 ——
  *   present 受 dirty 门控(pcm_shell.c), **静止画面下根本不被调用**,
@@ -571,7 +812,16 @@ void plat_post_cmd(void);
  * 这条路镜像模式已经验证过。⚠️ 只"不画"不够, 层还开着会一直扫我们上一帧。
  *
  * 🚨 绝不 disable 原厂的层, 只关我们自己这一块(gf1)。 */
-static int g_cover = 1;                  /* 1 = 我们盖着; 0 = 让给原厂 */
+static int g_cover = 1;                  /* 1 = 我们盖着; 0 = 让给原厂(声明在 push_layer 之前) */
+/* 层现在是不是**真的亮着并且显示的是我们的内容**。
+ * 和 g_cover 分开是故意的: g_cover 是"我们想不想显示", g_shown 是"显示出来了没有"。
+ * 接管的那一刻两者会有一段不相等 —— 那正是"先写帧再点亮"这条修法的全部内容。 */
+static int g_shown = 1;
+static int g_push_ok = 0;      /* 1 = 本次 push_layer 允许在首帧未就位时点亮(只给兜底用) */
+static int g_swap_pending = 0; /* 1 = 有一帧已经写好但换页被节流吞了, 欠着一次 */
+static unsigned g_swap_t0 = 0; /* 欠上的时刻 —— 用来验证补偿路径真的在补 */
+static unsigned g_cover_t0 = 0;          /* 上一次决定接管的时刻(兜底计时用) */
+static unsigned g_last_swap = 0;         /* 换页节流(定义提前到这里, set_cover 要用) */
 int  plat_ts_disarm(void);               /* 前置声明: 让开之前要先摘触摸门 */
 int  plat_ts_arm(void);                  /* 前置声明: 盖上之后要立刻装门 */
 extern int g_ts_armed_pub;               /* = g_ts_armed, 给这里手用(定义在触摸门那一节之后) */
@@ -582,10 +832,29 @@ static void set_cover(int on){
      *   而且这条路是**自动触发**的(页面白名单/让出协议), 不需要任何人操作。 */
     if(!on && g_ts_armed_pub) plat_ts_disarm();
     g_cover = on;
+    /* 🔒 镜像模式下**只记状态, 一个像素都不上屏**(模式高于覆盖, 见 plat_tick_watch)。
+     *   退出镜像模式时那边会按 g_cover 补推, 所以状态不会丢。 */
+    if(g_mode == 2){
+        plat_log(on ? "[覆盖] 记为接管(镜像模式: 不上屏)\n" : "[覆盖] 记为让开(镜像模式)\n");
+        return;
+    }
     if(on){
         g_force_full = 2;                /* 让开期间原厂画过, 两块都要重搬 */
-        push_layer();
-        plat_log("[覆盖] 接管屏幕\n");
+        /* 🚨 **绝不在这里点亮层。** 2026-08-14 用户在台架上看到"过渡时一段绿屏", 就是这句
+         *   原来的 push_layer() 干的: enable 是立刻生效的, 而我们的新一帧要等
+         *   渲染 27ms + 整屏拷贝 130ms + 换页节流 50ms ≈ **200ms** 才到位。
+         *   这 200ms 里层已经在扫 —— 扫的是**我们让开期间被原厂改过**的那块显存,
+         *   按 RGBA5551 解释出来就是花的。
+         * ⇒ 正解是把顺序反过来: **先把整帧写好, 再点亮**(点亮发生在 swap_bank 里)。
+         *   代价是这 200ms 屏幕上还是原厂页面 —— 那正是我们想要的中间态: 它本来就在那儿,
+         *   而且是一帧完整正确的画面。**做个过渡页反而更糟**: 过渡页自己也要走同一条
+         *   130ms 拷贝, 等于把一段花屏换成一段闪动(见 pcm_caps.h 的 CAP_SCREEN_TRANSITION)。
+         * 🛟 万一 present 一直没被调到(外壳不脏), plat_tick_watch 里有兜底会强推,
+         *   宁可闪一下也不能永远不显示。 */
+        g_shown = 0;
+        g_cover_t0 = plat_now_ms();
+        g_last_swap = g_cover_t0 - 100;  /* 让接管后的第一次换页不被 50ms 节流挡住 */
+        plat_log("[覆盖] 接管屏幕(等第一帧写好再点亮)\n");
         /* 🔒 **不变式: 我们盖着 ⟺ 原厂收不到触摸。** 这两件事只在这一个函数里维护。
          * 🚨 2026-08-14 用户定的形态。为什么必须绑在一起而不是靠人发命令装门:
          *   ① 靠记得发命令 ⇒ 一定有忘的时候, 而"页面盖着但原厂还在收触摸"就是穿透本身;
@@ -603,11 +872,14 @@ static void set_cover(int on){
     } else {
         gf_layer_disable(g_layer);
         gf_layer_update(g_layer, 0);
+        g_shown = 0;                     /* 层关了 = 屏上不是我们 */
+        g_swap_pending = 0;              /* 让开了就别再补那一帧, 回来时 g_force_full=2 会全画 */
         plat_log("[覆盖] 让开, 显示原厂\n");
     }
 }
 int plat_is_covering(void){ return g_cover; }
 
+static void swap_bank(void);   /* 定义在下面; tick_watch 要用它补被节流吞掉的换页 */
 void plat_tick_watch(void){
     static int last_mode = -1;
     if(!g_vaddr) return;
@@ -636,14 +908,56 @@ void plat_tick_watch(void){
     }
     /* 进/出镜像模式时真开关层 —— 只是"不画"不够, 层还开着会一直扫我们上一帧的内容。
      * 用 disable+update(唯一真关的办法), 出来时靠 push_layer 重新开。 */
+    /* 🔒 **模式高于覆盖。** 这两个状态原来各管各的, 有两个方向都会出错:
+     *   ① 镜像模式下 set_cover(1)(页面路由或 SOURCE 键触发)会 push_layer 把层点亮 ——
+     *      而镜像模式的承诺就是"一个像素都不上屏"。
+     *      (以前没暴露, 纯粹因为 g_cover 初值是 1, 头一次 set_cover(1) 被当成没变化早退了。)
+     *   ② 退出镜像模式时无条件 push_layer —— 哪怕此刻我们本该是**让开**状态,
+     *      也会一把把屏幕抢回来, 盖住原厂。
+     *   ⇒ 现在: 进镜像一律关层; 退镜像**只在 g_cover 时**才重新推。
+     *     set_cover 自己那边也加了同样的判断(镜像期间只记状态)。 */
     if(g_mode == 2 && last_mode != 2){
         gf_layer_disable(g_layer); gf_layer_update(g_layer, 0);
+        g_shown = 0;
         plat_log("[镜像模式] 已让出屏幕, 原厂界面可见; 只读状态并打日志\n");
     } else if(g_mode != 2 && last_mode == 2){
-        g_force_full = 2; push_layer();   /* 🚨 双缓冲下必须 2 —— 两块各要一次全搬, 写 1 的话另一块永远留着旧像素 */
-        plat_log("[镜像模式] 退出, 重新接管屏幕\n");
+        if(g_cover){
+            /* 🚨 双缓冲下必须 2 —— 两块各要一次全搬, 写 1 的话另一块永远留着旧像素。
+             * 🔒 和 set_cover 一样**不在这里点亮**: 镜像期间原厂画过我们这块显存,
+             *   立刻 enable 会亮出花屏。交给 swap_bank(首帧写好后)去点。 */
+            g_force_full = 2;
+            g_shown = 0; g_cover_t0 = plat_now_ms(); g_last_swap = g_cover_t0 - 100;
+            plat_log("[镜像模式] 退出, 重新接管屏幕(等第一帧写好再点亮)\n");
+        } else {
+            plat_log("[镜像模式] 退出, 但当前是让开状态 -> 不抢屏\n");
+        }
     }
     last_mode = g_mode;
+    /* 🛟 兜底: "想显示但一直没显示出来"不许长期存在。
+     *   正常路径是 present -> swap_bank 点亮, 而 present 受外壳 dirty 门控 ——
+     *   万一接管之后外壳因为任何原因没标脏, 我们就会**永远黑着**(层是关的, 原厂也被我们
+     *   的场景状态挡在外面), 那比闪一下糟糕得多, 而且现场根本看不出是这个原因。
+     *   ⇒ 500ms 还没点亮就强推一把, 并且**把这件事打进日志** —— 它不该发生,
+     *     真发生了要能查到, 不能让兜底静默地把 bug 盖住。 */
+    if(g_cover && !g_shown && g_mode != 2 && g_layer &&
+       plat_now_ms() - g_cover_t0 > 500){
+        plat_log("⚠ [覆盖] 500ms 还没点亮 -> 强推(正常不该走到这里)\n");
+        g_force_full = 2;
+        g_push_ok = 1; push_layer(); g_push_ok = 0;   /* 唯一允许绕过闸门的地方 */
+        g_shown = 1;
+    }
+    /* 🔁 补上被 50ms 节流吞掉的那次换页。放这里是因为 plat_tick_watch **每拍都跑**,
+     *   而 plat_present 受外壳 dirty 门控 —— 靠 present 补等于靠"还会有下一帧", 那正是病根。 */
+    if(g_swap_pending && g_cover && !g_yield && g_mode != 2 && g_dbuf){
+        /* 🔎 欠着的换页超过 200ms 还没补上 = 补偿路径本身坏了。
+         *   节流窗口才 50ms, 正常情况下一两拍就补掉了。**报出来**, 别让它退回静默丢帧 ——
+         *   那个症状(切页后屏幕纹丝不动)找起来极贵, 这次就花了半小时。 */
+        if(plat_now_ms() - g_swap_t0 > 200){
+            plat_log("⚠ [上屏] 欠着的换页 200ms 没补上 -> 补偿路径有问题\n");
+            g_swap_t0 = plat_now_ms();
+        }
+        swap_bank();
+    }
     if(g_mode != 2) yield_check();
 }
 
@@ -716,14 +1030,25 @@ static int present_diff(void){
 
 /* 画完之后把刚画好的那块推上前台, 并把 g_vaddr 指向另一块准备画下一帧。
  * 🚨 换页必须是"整块一次提交" —— 这正是双缓冲的意义: 屏上要么是旧帧要么是新帧, 没有中间态。 */
-static unsigned g_last_swap = 0;
 static void swap_bank(void){
     gf_surface_t cur = g_bank ? g_surf2 : g_surf;
     /* 🚨 换页频率必须限住。gf_layer_update 是有前科的地方(紧循环里 REPLY-block 死锁,
      *   2026-08-05 亲自踩过, pidin 显示 REPLY 4104)。原来是 1 秒一次, 现在每帧都要换页 ——
      *   所以限到 20Hz, 而且用 NO_WAIT_VSYNC 不等垂直同步。静止画面本来就不换(rows==0)。 */
     unsigned now = plat_now_ms();
-    if(now - g_last_swap < 50) return;         /* 太快就先不换, 下一帧再说(内容已经在后台备好) */
+    /* 🚨🚨 被节流吞掉时**必须记下"还欠一次换页"**。
+     *   2026-08-14 用户实测的病: 在蓝牙页按 SOURCE, 场景切了、日志也对, 但**屏幕纹丝不动**,
+     *   再按一次更没反应(外壳判到已经在音源页, 直接返回)。
+     *   根因就是这句早退里那条注释——"下一帧再说"。**下一帧可能根本不存在**:
+     *   外壳是 dirty 驱动的, 切完页就不脏了; 只要切页那一拍正好落在上次换页的 50ms 内
+     *   (蓝牙页刚连上 MME、状态在变时极容易), 这一帧就被静默丢掉,
+     *   内容躺在后台 bank 里, 屏幕永远停在旧帧。
+     *   ⇒ 欠着的那次由 plat_tick_watch 补上 —— 它**每拍都跑, 不受 dirty 门控**。 */
+    if(now - g_last_swap < 50){
+        if(!g_swap_pending) g_swap_t0 = now;
+        g_swap_pending = 1; return;
+    }
+    g_swap_pending = 0;
     g_last_swap = now;
     gf_layer_set_surfaces(g_layer, &cur, 1);
     /* set_surfaces 会冲掉其它绑定, 全部重申(这条是 08-05 实证的铁律) */
@@ -733,6 +1058,16 @@ static void swap_bank(void){
     gf_display_set_layer_order(g_disp, g_order, 0);
     gf_layer_enable(g_layer);
     gf_layer_update(g_layer, GF_LAYER_UPDATE_NO_WAIT_VSYNC);
+    /* 🔑 层是在**这里**才第一次亮起来的(接管时 set_cover 故意没点亮)。
+     *   走到这一句时整帧已经写进这块 bank 了, 所以用户看到的第一眼就是完整画面。 */
+    if(!g_shown){
+        /* 📏 把"决定接管 -> 画面真的出现"这段延迟量出来。
+         *   这个数决定要不要做加载态: 200ms 上下不值得做(转圈还没转起来就没了),
+         *   真要是几百毫秒才该做。**别拿猜的数做设计决定。** */
+        plat_log("[覆盖] 首帧就位, 接管耗时 "); p_logd((int)(plat_now_ms() - g_cover_t0));
+        plat_log("ms\n");
+    }
+    g_shown = 1;
     g_front = cur;                                        /* 记住前台, 周期重申要用 */
     /* swap_bank 本身就是完整的重申序列(set_surfaces->blending->两个 viewport->order->enable->update),
      * 刚跑完没必要 1ms 后再来一遍 —— 给重申计时续期。
@@ -785,6 +1120,23 @@ void plat_present(void){
     unsigned now, t_copy;
     static unsigned acc = 0, cnt = 0, accrow = 0;
     int rows;
+    /* 📏 上屏诊断: "场景切了但屏幕没变"这类问题, 光看外壳日志永远查不出来 ——
+     *   外壳只知道自己画进了 g_fb, 而**从 g_fb 到显存**这一段有五个早退口。
+     *   所以每个早退口都留个原因, 变化时打一次(不是每拍打, 那会刷爆日志)。 */
+    { static int last_why = -1; int why = 0;
+      if(!g_vaddr)        why = 1;
+      else if(g_mode == 2) why = 2;
+      else if(!g_cover)    why = 3;
+      else if(g_yield)     why = 4;
+      if(why != last_why){
+          last_why = why;
+          if(why){
+              plat_log("[上屏] 停止, 原因=");
+              plat_log(why==1 ? "显存没映射\n" : why==2 ? "镜像模式\n"
+                     : why==3 ? "让开态(屏幕归原厂)\n" : "让出态(原厂在用这层)\n");
+          } else plat_log("[上屏] 恢复\n");
+      }
+    }
     if(!g_vaddr) return;
     if(g_mode == 2){ g_force_full = 2; return; }   /* 镜像模式: 一个像素都不上屏 */
     if(!g_cover){ g_force_full = 2; return; }      /* 让开态: 屏幕是原厂的, 我们一个像素都不写 */
@@ -798,7 +1150,14 @@ void plat_present(void){
 
     now = plat_now_ms();
     rows = present_diff();
-    if(g_dbuf && rows > 0) swap_bank();       /* 有变化才换页; 没变化换了也是白费一次 update */
+    { unsigned before = g_last_swap;
+      if(g_dbuf && rows > 0) swap_bank();     /* 有变化才换页; 没变化换了也是白费一次 update */
+      /* 📏 大改动(切页级)必须看见它到底换没换页。行数少的日常刷新不打, 免得刷屏。 */
+      if(rows > 100){
+          plat_log("[上屏] 搬行="); p_logd(rows);
+          plat_log(g_last_swap != before ? "  换页=是\n" : "  换页=**被50ms节流吞掉**\n");
+      }
+    }
     if(g_force_full > 0) g_force_full--;
     t_copy = plat_now_ms() - now;
     acc += t_copy; cnt++; accrow += (unsigned)rows;
@@ -821,7 +1180,9 @@ void plat_present(void){
     /* 🚨 重申必须是**完整序列**(push_layer): set_surfaces 会冲掉 blending 和几何绑定,
      *   只补 enable/set_surfaces/order/update 等于每秒把层打回缺绑定态。 */
     now = plat_now_ms();
-    if(now - g_last_reassert >= 1000){
+    if(g_shown && now - g_last_reassert >= 1000){
+        /* ⚠️ `g_shown &&` 不能少: 接管后第一帧还没换页成功时, 这里推一把等于
+         *   把**还没写好的那块** bank 亮出来 —— 正是我们刚修掉的那段花屏。 */
         push_layer();                           /* ← 只在这里, 1 秒一次 */
         g_last_reassert = now;
     }
@@ -1010,6 +1371,86 @@ static int read_page_id(void){
     if(g_mm && fd_rd(g_rl, g_mm + MM_OFF_ID, b, 2) == 2)
         return (int)b[0] | ((int)b[1] << 8);
     return -1;
+}
+
+
+/* ============ 内存差分探针(只读) ============
+ * 🚨 为什么要它: 找"原厂把按键记在哪"这类未知字段时, 靠猜偏移一次只能试 8 个字,
+ *   每次还要一个串口往返。差分法把这件事反过来 —— **让机器找**:
+ *     按键前拍一张快照 -> 你按键 -> 拍第二张 -> 只报变化的字。
+ *   变了的就是候选, 没变的直接排除。一次能覆盖 512 字节。
+ * 用法(命令通道):
+ *   echo "20 <十进制地址> <十进制长度>" > /tmp/studio_post   拍快照
+ *   echo "21" > /tmp/studio_post                             与快照比对, 只打变化处
+ * 🚨 **参数是十进制**。plat_post_cmd 的解析是 `v*10+digit`, 只认十进制 ——
+ *   这行注释原来写的是 "<hex地址>", 照着发过去会读到一个完全不相干的地址,
+ *   而 diff_snap 读得到就照读, **不会报错**, 于是拿到一堆"变化的字"全是噪声。
+ *   (日志里会回显地址, 对不上就是这个坑。)
+ * ⚠️ 纯读 PCM3Reload, 一个字节都不写。 */
+#define DIFF_MAX 512
+static unsigned char g_diff_snap[DIFF_MAX];
+static u32 g_diff_va = 0;
+static int g_diff_len = 0;
+
+static void diff_snap(u32 va, int len){
+    if(len <= 0 || len > DIFF_MAX) len = DIFF_MAX;
+    if(g_rl < 0){ plat_log("[差分] PCM3Reload 没打开\n"); return; }
+    if(fd_rd(g_rl, va, g_diff_snap, len) != len){
+        plat_log("[差分] 读不到 "); p_logh(va); plat_log("\n"); g_diff_len = 0; return;
+    }
+    g_diff_va = va; g_diff_len = len;
+    plat_log("[差分] 已拍快照 "); p_logh(va);
+    plat_log(" 长度 "); p_logd(len); plat_log(" —— 现在去按键, 然后发 21\n");
+}
+static void diff_cmp(void){
+    unsigned char now[DIFF_MAX];
+    int i, n = 0;
+    if(!g_diff_len){ plat_log("[差分] 还没拍快照\n"); return; }
+    if(fd_rd(g_rl, g_diff_va, now, g_diff_len) != g_diff_len){
+        plat_log("[差分] 二次读失败\n"); return;
+    }
+    plat_log("[差分] 变化的字:\n");
+    for(i = 0; i + 3 < g_diff_len; i += 4){
+        u32 a = le32(g_diff_snap + i), b = le32(now + i);
+        if(a == b) continue;
+        n++;
+        plat_log("  +0x"); p_logh(g_diff_va + (u32)i); plat_log("  ");
+        p_logh(a); plat_log(" -> "); p_logh(b); plat_log("\n");
+    }
+    if(!n) plat_log("  (一个字都没变)\n");
+    else { plat_log("  共 "); p_logd(n); plat_log(" 处\n"); }
+    /* 把当前值当成新基线, 方便连续按不同的键做多轮对照 */
+    for(i = 0; i < g_diff_len; i++) g_diff_snap[i] = now[i];
+}
+
+/* ============ 逐拍监视(只读)============
+ * 🚨 存在的理由 —— 差分探针(20/21)有个结构性的洞, 2026-08-14 当场撞上:
+ *   它只比**两个瞬间**。而按键是"按下 → 抬起"的**瞬态**, 等我发第二条命令的时候
+ *   字段早就复位了 ⇒ 瞬态在差分里**永远是隐形的**, 而"没看到变化"会被误读成"这里没东西"。
+ *   引擎本来就是 40Hz 轮询, 让它自己盯着就行。
+ * 用法: `23 <十进制地址> <十进制长度>` 开始盯(长度<=64), `24` 停。
+ *   只在变化时打一行, 静止时零输出。⚠️ 盯的区间别选进噪声区, 否则日志会被刷爆。
+ * 全程只读。 */
+#define WATCH_MAX 64
+static u32 g_watch_va = 0;
+static int g_watch_len = 0, g_watch_have = 0;
+static unsigned char g_watch_prev[WATCH_MAX];
+static void diff_watch_tick(void){
+    unsigned char now[WATCH_MAX];
+    int i;
+    if(!g_watch_len || g_rl < 0) return;
+    if(fd_rd(g_rl, g_watch_va, now, g_watch_len) != g_watch_len) return;
+    if(!g_watch_have){
+        for(i=0;i<g_watch_len;i++) g_watch_prev[i] = now[i];
+        g_watch_have = 1; return;
+    }
+    for(i = 0; i + 3 < g_watch_len; i += 4){
+        u32 a = le32(g_watch_prev + i), b = le32(now + i);
+        if(a == b) continue;
+        plat_log("[盯] +0x"); p_logh(g_watch_va + (u32)i);
+        plat_log("  "); p_logh(a); plat_log(" -> "); p_logh(b); plat_log("\n");
+    }
+    for(i=0;i<g_watch_len;i++) g_watch_prev[i] = now[i];
 }
 
 /* ============ 触摸: 只读镜像 PCM3Reload 的 CHBKey2MSMEventMapper ============
@@ -1633,10 +2074,16 @@ static void pup_diag(void){
  *     (requestScan 就必须传 0 才有效)。
  * ⚠️ **文件读发生在 studio 自己的进程/线程里**, 想读多少次都行 ——
  *   原厂那个时间敏感的线程每拍只读一个字节。这正是这套方案的关键: 把 I/O 挪到我们这边。 */
+static void read_hardkey(void);   /* 定义在输入那一节(靠后), 这里每拍调一次 */
 void plat_post_cmd(void){
     int fd; char b[72]; int n, i = 0, f[6] = {0,0,0,0,0,0}, k = 0, has = 0;
     u32 v = 0;
     pup_poll();                                  /* 每拍都要跑, 回执才收得到 */
+    diff_watch_tick();                           /* 逐拍监视(默认关, 命令 23 打开) */
+    /* 🔒 硬键**故意放在覆盖守卫之外** —— 它是纯读 + 只打日志, 而且产品形态上
+     *   "按 SOURCE 把我们唤回来"必须在让开状态下也能听见。等它要真动作时,
+     *   动作那一步照样得过 plat_command 的咽喉守卫。 */
+    read_hardkey();
     fd = open("/tmp/studio_post", O_RDONLY, 0);
     if(fd < 0) return;
     n = read(fd, b, 71); close(fd);
@@ -1667,6 +2114,21 @@ void plat_post_cmd(void){
           } break;
         case 10: plat_ts_arm(); break;      /* 触摸门: 装 */
         case 11: plat_ts_disarm(); break;   /* 触摸门: 摘 */
+        case 20: diff_snap((u32)f[1], f[2] ? f[2] : DIFF_MAX); break;   /* 差分: 拍快照 */
+        case 21: diff_cmp(); break;                                     /* 差分: 比对 */
+        case 22:                            /* 差分: 直接拍映射器对象 */
+            if(!g_kmP) plat_log("[差分] 映射器没锚到\n");
+            else diff_snap(g_kmP, 256);
+            break;
+        case 23:                            /* 逐拍盯住一小段, 只报变化(抓瞬态) */
+            g_watch_va = (u32)f[1];
+            g_watch_len = f[2] ? f[2] : 32;
+            if(g_watch_len > WATCH_MAX) g_watch_len = WATCH_MAX;
+            g_watch_have = 0;
+            plat_log("[盯] 开始 "); p_logh(g_watch_va);
+            plat_log(" 长度 "); p_logd(g_watch_len); plat_log(" (停: 24)\n");
+            break;
+        case 24: g_watch_len = 0; g_watch_have = 0; plat_log("[盯] 停\n"); break;
         case 13: { int rnd = -1, rep = -1;  /* MME 只读探针: 随机 + 重复。**改之前先跑它记下原值** */
             if(mme_get_mode(0, &rnd)) plat_log("[MME] 读随机失败\n");
             else { plat_log("[MME] 随机="); p_logd(rnd);
@@ -2094,28 +2556,66 @@ void plat_read_state(PcmState *st){
         s.pos_ms = 0; s.dur_ms = 0; s.u_hour = -1; s.u_minute = -1;
         s.freq_khz = -1; s.u_freq_am_khz = -1; s.muted = -1; s.ignition = -1;
         s.title[0] = 0; s.artist[0] = 0; s.album[0] = 0; s.genre[0] = 0; s.device[0] = 0;
-        if(g_as < 0){ g_as = open_as(); plat_log("PCM3Root as fd="); p_logd(g_as); plat_log("\n"); }
-        if(g_as >= 0) locate_v4();
-        /* 第二个 fd: PCM3Reload(当前页 id 在它里面)。pid 由 goprobe/gostudio 写进 /tmp/rlpid,
-         * ⚠️ 用 pidin 现查, 别写死 —— 写死的 PID 变了就静默读到别的进程。 */
-        if(g_rl_w < 0) g_rl_w = open_as_pidfile_rw("/tmp/rlpid");
-        if(g_rl < 0){ g_rl = open_as_pidfile("/tmp/rlpid");
-            plat_log("PCM3Reload as fd="); p_logd(g_rl); plat_log("\n"); }
-        if(g_rl >= 0){ locate_menumgr(); locate_keymapper(); }
+        inited = 1;
+    }
+    /* ============ 锚定: **一直重试到锚上为止** ============
+     * 🚨 2026-08-14 台架实地踩到, 花了半小时: 这一整块原来在 `if(!inited)` 里面,
+     *   **进程一辈子只跑一次**。而 /tmp 每次重启都被清空, pid 文件由别的脚本写、
+     *   写的时刻不受我们控制(而且 debugTools.sh 只写 p3pid, **根本不写 rlpid**)。
+     *   ⇒ studio 只要比 pid 文件早起来一秒, 就**永久**没有 PCM3Reload:
+     *     没有页 id、没有触摸、没有曲目信息 —— 而且之后一个字都不再报,
+     *     日志看上去一切正常, 界面只是"什么都读不到"。这种沉默的半死状态最贵。
+     *   ⇒ 现在改成: 没锚上就每秒重试一次, 锚上了就再也不试。
+     *
+     * 【为什么重试是廉价的】贵的是那几个堆扫(locate_*), 而它们**只在 fd 从无到有的
+     *   那一拍**跑一次。稳态下这里只剩一个必然失败的 open(), 而且一秒才一次。
+     * 【为什么不干脆自己找 pid】没有 readdir 就得暴力枚举 pid, 这台机器的 pid
+     *   能到七位数, 不可行。所以依赖外部 pid 文件这件事本身没变 ——
+     *   变的是**它晚到不再是致命的**。 */
+    if(g_as < 0 || g_rl < 0){
+        static unsigned next_try = 0;
+        static int moaned = 0;
+        unsigned now = plat_now_ms();
+        if(now >= next_try){
+            next_try = now + 1000;
+            if(g_as < 0){
+                g_as = open_as();
+                if(g_as >= 0){ plat_log("PCM3Root as fd="); p_logd(g_as); plat_log("\n"); locate_v4(); }
+            }
+            /* ⚠️ 用 pidin 现查写进 pid 文件, 别写死 —— 写死的 PID 变了就静默读到别的进程。 */
+            if(g_rl_w < 0) g_rl_w = open_as_pidfile_rw("/tmp/rlpid");
+            if(g_rl < 0){
+                g_rl = open_as_pidfile("/tmp/rlpid");
+                if(g_rl >= 0){
+                    plat_log("PCM3Reload as fd="); p_logd(g_rl); plat_log("\n");
+                    locate_menumgr(); locate_keymapper();
+                }
+            }
+            /* 只抱怨一次 —— 但**必须抱怨**, 否则"读不到任何原厂状态"没有任何提示。 */
+            if(!moaned && (g_as < 0 || g_rl < 0)){
+                moaned = 1;
+                plat_log("⚠ 还没锚上原厂进程(p3pid/rlpid 还没出现), 每秒重试中。\n"
+                         "  手动补: echo <PCM3Root的pid> > /tmp/p3pid; echo <PCM3Reload的pid> > /tmp/rlpid\n");
+            }
+        }
+    }
+    /* F2 那一条只在 g_V 真锚到之后打一次 —— 以前它跟锚定同块, 锚定失败就永远不打。 */
+    { static int f2_done = 0;
+      if(!f2_done && g_V){
+        f2_done = 1;
         /* 🔬 只读验证一个**还没收敛**的假设(F2):
          *   0x0864b500 是不是 == CPSoundPresCtrl 单例 == 我们锚到的 OBJ(V-0x218)?
          *   ⚠️ KB 里"垃圾 this 已排除"是证据倒置 —— ELF 静态值 0 对运行期取值零信息量,
          *      而且它落在 .as 采集空洞 [0x08643000,0x08650000) 里, 四份快照都没采到,
          *      **离线永远判不了**。只能上机读这一个字。开机打一次, 想再看走级 0 诊断。
          *   纯读一个字, 零风险。 */
-        if(g_V){ u32 sing = 0;
-            if(rd32(0x0864b500u, &sing) == 0){
-                plat_log("[验] 0x0864b500="); p_logh(sing);
-                plat_log(" 我们的OBJ="); p_logh(g_V - 0x218u);
-                plat_log(sing == g_V - 0x218u ? "  ⇒ 同一对象 ✓\n" : "  ⇒ 不同 ✗\n");
-            } }
-        inited = 1;
-    }
+        { u32 sing = 0;
+          if(rd32(0x0864b500u, &sing) == 0){
+              plat_log("[验] 0x0864b500="); p_logh(sing);
+              plat_log(" 我们的OBJ="); p_logh(g_V - 0x218u);
+              plat_log(sing == g_V - 0x218u ? "  ⇒ 同一对象 ✓\n" : "  ⇒ 不同 ✗\n");
+          } }
+      } }
     /* 音量(已验证的活链) */
     if(g_P){
         u32 ok = 0; u8_ v = 0;
@@ -2202,12 +2702,10 @@ void plat_read_state(PcmState *st){
      *   页 id:          855=FM页   375=蓝牙播放页   387=切到AUX/蓝牙后、进播放页前那一页
      *                   65534(0xFFFE)=换页过渡哨兵, **不是真实页, 必须忽略**
      * ⚠️ app 是比 slot 更稳的判据(slot 起始还出现过 13, app 恒为 1)。 */
-    switch(s_app){
-        case 1:  s.source = SRC_FM;  break;
-        case 6:  s.source = SRC_AUX; break;
-        case 7:  s.source = SRC_BT;  break;
-        default: break;                        /* 没见过的值就保持原样, 别乱跳 */
-    }
+    { int i;
+      for(i = 0; i < SRCTAB_N; i++)
+          if(SRCTAB[i].app == s_app){ s.source = SRCTAB[i].src; break; }
+    }   /* 表里没有的 app 值就保持原样, 别乱跳 */
     /* ---- 蓝牙曲目 ----
      * 🚨 必须**先过音源门**。不过门的话, 听 FM 时会把陈旧的蓝牙数据镜像成"已暂停、无曲目"
      *   (真车 FM 那两份 dump 读出来就是 STOPPED + 空串)。 */
@@ -2314,10 +2812,80 @@ void plat_read_state(PcmState *st){
     *st = s;
 }
 
-/* ================= 输入 / 命令: 待打通 ================= */
+/* ============ 硬键(SOURCE / MEDIA / …)—— 只读 ============
+ * 2026-08-14 台架实证得到的模型(逐拍监视 + 空白对照 + 换键对照, 每条都复现过):
+ *   · `+0x64` = **键码, 锁存**。SOURCE=0x0d, MEDIA=0x07。按同一个键两次它不变 ——
+ *     所以**光靠它判不了"又按了一次"**(原厂不受影响: 它收事件, 不轮询内存)。
+ *   · `+0x6c` = **按键沿**。每次按都脉冲 `3 → 0 → 3`, 连按同一个键照样有。
+ *     🚨 这个字段差分探针(20/21)**永远看不见** —— 它是瞬态, 两次采样之间早复位了。
+ *     当时"没看到变化"差点被我读成"这里没东西"。是 40Hz 逐拍监视把它抓出来的。
+ *   ⇒ 判据 = **在 `+0x6c` 落到 0 的那一拍读 `+0x64`**。
+ * ✅ 触摸**不会**触发它 —— 2026-08-14 台架负对照(点屏幕零日志)+ 正对照(紧接着按
+ *   SOURCE 立刻有)双向验过。没有正对照的"什么都没发生"不算证据。 */
+#define KM_OFF_KEYCODE 0x64
+#define KM_OFF_KEYEDGE 0x6c
+#define HWKEY_SOURCE 0x0d
+#define HWKEY_MEDIA  0x07
+static u32 g_key_edge_prev = 0xffffffffu;
+static int g_key_pending = 0;      /* 收到一次沿, 等 plat_poll_event 取走 */
+/* 每拍跑一次。返回值无意义, 结果放 g_key_pending。 */
+static void read_hardkey(void){
+    unsigned char b[12];
+    u32 code, edge;
+    if(!g_kmP || g_rl < 0) return;
+    /* 一次读回 0x64..0x6f, 别分两次 —— 中间可能被改, 会把码和沿配错对。 */
+    if(fd_rd(g_rl, g_kmP + KM_OFF_KEYCODE, b, 12) != 12) return;
+    code = le32(b + 0);
+    edge = le32(b + (KM_OFF_KEYEDGE - KM_OFF_KEYCODE));
+    if(g_key_edge_prev != 0xffffffffu && g_key_edge_prev != 0 && edge == 0){
+        plat_log("[硬键] 沿 -> 键码="); p_logh(code);
+        plat_log(code == HWKEY_SOURCE ? "  (SOURCE)\n"
+               : (code == HWKEY_MEDIA ? "  (MEDIA)\n" : "  (没见过, 忽略)\n"));
+        /* 🔒 **只认我们真的要处理的键**。其余一律不产生事件 ——
+         *   原厂自己会处理它们, 我们插一脚只会打架。白名单而不是黑名单:
+         *   以后固件里冒出新键码, 默认是"不管"而不是"乱管"。 */
+        if(code == HWKEY_SOURCE) g_key_pending = K_SOURCE;
+    }
+    g_key_edge_prev = edge;
+}
+
+/* ============ 不变式: 我们没盖着屏幕 ⇒ 不收输入、不发命令 ============
+ * 🚨 2026-08-14 台架上真的出事了, 所以这条必须由代码保证, 不能靠"场景自己注意":
+ *   studio 跑在**镜像模式**(不上屏, 只观察), 用户看着原厂界面点了一下屏幕 ——
+ *   而我们那个**看不见的** home 场景照样收到了这次触摸, 按自己的版式算出"点在了
+ *   AUX 卡片上", 于是 `CMD_SET_SOURCE` 一路走到傀儡 cave, **真把原厂的音源切了**。
+ *   日志里 `[傀儡] ✅ 落地 ... 真调了白名单序号 0` 是硬证据。
+ *
+ * 【为什么这不是"镜像模式的小毛病"】同一个洞在**正常模式下也在**:
+ *   遇到非白名单页我们会让开屏幕(set_cover(0)), 这时用户看到的是原厂页、点的是
+ *   原厂控件, 而我们隐藏的场景仍在用自己的坐标解释这些触摸 —— 随时可能发出命令。
+ *   ⇒ 判据不是"什么模式", 而是**"用户此刻看到的是不是我们"**。
+ *
+ * 【为什么做在这两个地方】
+ *   ① plat_poll_event: 根上就不把事件交出去, 场景连"想歪"的机会都没有;
+ *   ② plat_command: 咽喉。以后新增任何场景、任何路径, 都躲不过这一关。
+ *   只做①不够 —— 场景可能因为别的原因(定时器、状态变化)发命令。 */
+static int cover_owns_input(void){
+    /* g_mode==2 镜像模式: 屏幕整个让给原厂; g_cover==0: 让开中。两种都不是"我们在显示"。 */
+    return g_mode != 2 && g_cover;
+}
+
+/* ================= 输入 / 命令 ================= */
 int plat_poll_event(PcmEvent *ev){
-    /* 真实触摸优先 —— 只读镜像, 不抢原厂事件流 */
-    if(read_touch(ev)) return 1;
+    /* 🔓 **SOURCE 硬键是覆盖守卫唯一的例外, 而且是故意的。**
+     *   我们让开屏幕之后, 它是用户把我们叫回来的**唯一**办法 —— 挡掉就没有回头路了。
+     *   为什么这个例外不危险(和被挡掉的触摸对比着看):
+     *     · 触摸是**坐标**, 让开时用户点的是原厂控件, 我们按自己的版式去解释它 = 猜错;
+     *     · 硬键是**键码**, 直接从原厂映射器读出来的, 不存在"这一下是点给谁的"这种歧义。
+     *   而且它只做导航(切到我们的音源页), 不走 plat_command —— 真要发命令仍得过咽喉守卫。 */
+    if(g_key_pending){ ev->type = EV_KEY_DOWN; ev->which = 0; ev->arg = g_key_pending;
+                       ev->x = ev->y = 0; g_key_pending = 0; return 1; }
+    /* 🔒 没盖着就一个事件都不往上交(见 cover_owns_input 上面的说明)。
+     *   ⚠️ 但**必须照样把 read_touch 跑一遍** —— 它维护 g_ts_down 这个"手指还按着"的
+     *   状态机。跳过会让状态机停在按下态, 等我们盖回来时第一次抬起被吃掉。 */
+    { PcmEvent tmp; int got = read_touch(&tmp);
+      if(!cover_owns_input()) return 0;
+      if(got){ *ev = tmp; return 1; } }
     /* ⏳ FPGA/IPC 输入还没打通(最大技术风险, IPC 读挂死过车+台架, 必须找只读 tap)。
      *    在此之前系统只显示不交互 —— 场景代码已经写好, 通了直接就能用。
      *    调试用: 串口写 /tmp/studio_ev 一行 "type which arg x y" 就能注入一个事件。 */
@@ -2711,6 +3279,15 @@ static int mme_get_speed(int *out){
 int plat_command(int cmd, int arg){
     PcmState st;
     int d;
+    /* 🔒 咽喉守卫: 没盖着屏幕就一条命令都不发。理由见 cover_owns_input 上面那段
+     *   (2026-08-14 镜像模式下一次误触真切了原厂音源)。
+     *   放在这里而不是各场景里, 是因为**以后新增的路径也躲不过这一关**。
+     *   ⚠️ 故意不给"内部调用"开后门 —— 一开后门, 这条守卫三个月后就名存实亡。 */
+    if(!cover_owns_input()){
+        plat_log("[命令] ⛔ 当前没盖着屏幕(镜像/让开中), 拒发命令 cmd=");
+        p_logd(cmd); plat_log("\n");
+        return -1;
+    }
     switch(cmd){
         case CMD_SET_VOLUME:
             plat_read_state(&st);
@@ -2720,9 +3297,14 @@ int plat_command(int cmd, int arg){
             { int op = d > 0 ? PUP_OP_VOL_UP : PUP_OP_VOL_DOWN;
               if(pup_ensure_armed(op)) return -1;
               return pup_arm_op(PUP_LEVEL_REAL, op, (u32)(d > 0 ? d : -d), 0, 0); }
-        case CMD_SET_SOURCE:                        /* arg = 原厂**槽**号(FM=11 AUX=26 BT=40) */
-            if(!arg){ plat_log("cmd: 源号不能是 0\n"); return -1; }
-            return pup_arm_op(PUP_LEVEL_REAL, PUP_OP_ENTERT_SOURCE_CHANGED, (u32)arg, 0, 0);
+        /* arg = **我们的 SRC_***, 不是原厂槽号 —— 槽号是平台细节, 场景不该知道。
+         * 🚨 这里以前收的是槽号, 而唯一的调用点(scene_home)传的是 SRC_*, 静默错了很久:
+         *   两边都是 int, 编译器帮不上忙。改成只收 SRC_* 之后, 映射由 SRCTAB 独占。 */
+        case CMD_SET_SOURCE: {
+            int slot = src_to_slot(arg);
+            if(slot <= 0){ plat_log("cmd: 不认识的音源 SRC="); p_logd(arg); plat_log("\n"); return -1; }
+            return pup_arm_op(PUP_LEVEL_REAL, PUP_OP_ENTERT_SOURCE_CHANGED, (u32)slot, 0, 0);
+        }
         case CMD_TUNE:                              /* arg = kHz */
             if(pup_ensure_armed(PUP_OP_TUNER_FREQUENCY)) return -1;
             return pup_arm_op(PUP_LEVEL_REAL, PUP_OP_TUNER_FREQUENCY, (u32)arg, 1, 0);
@@ -2747,5 +3329,9 @@ int plat_command(int cmd, int arg){
  *   QEMU 也没建模它(sim 跑通≠车上跑通, 违反 sim==car 硬规则)。这条已判死, 别再试。
  *   真要提速看 Carmine 2D 硬件 blit(libgdcApiCarmine.so 里 gf_draw_* 是真函数体), 但它要抢绘图锁, 风险另算。 */
 int plat_can_animate(void){ return 0; }
+
+/* 用户按了 SOURCE ⇒ 把屏幕收回来。走 set_cover 而不是自己动 gf,
+ * 因为"盖着 ⟺ 原厂收不到触摸"这条不变式由 set_cover 独占维护(它会顺手装触摸门)。 */
+void plat_take_screen(void){ set_cover(1); }
 
 #endif /* PLAT_PCM_C */

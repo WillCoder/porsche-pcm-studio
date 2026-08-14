@@ -27,4 +27,9 @@ void plat_touchgate_probe(void);   /* 纯读探测, 零写入 */
 /* 诊断: 读 PCM3Reload 任意地址 */
 void plat_peek2(void);
 
+/* 单实例锁。**main() 的第一句**, 早于任何 plat_log(首写带 O_TRUNC)。
+ * 返回 0 = 锁到手; 非 0 = 已经有一个活着的 studio, 直接退出别继续。
+ * 释放在 plat_shutdown() 里, 跟 gf 层同生共死。理由见 plat_pcm.c 的定义处。 */
+int  plat_claim_singleton(void);
+
 #endif /* PLAT_INTERNAL_H */

@@ -14,6 +14,8 @@
 #ifndef PLAT_MAC_C
 #define PLAT_MAC_C
 
+#include <fcntl.h>
+#include <unistd.h>
 #include "../sys/pcm_sys.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +37,69 @@ static unsigned now_ms_raw(void){
 
 const char *plat_name(void){ return "mac"; }
 unsigned plat_now_ms(void){ return now_ms_raw() - g_t0_ms; }
+
+#define CFG_PATH "/tmp/pcm_studio/studio.conf"
+
+/* ================= 设置持久化 =================
+ * 格式: 一行一项 `key=0|1`, 认不出的键直接忽略(向前兼容: 老版本读新文件不会炸)。
+ * 文件不存在 = 用默认值, 不是错误 —— 第一次跑本来就没有。
+ * 🚨 set 立刻落盘。攒着不写的话, 一次断电就把用户的设置吞了, 而车机断电是常态。 */
+static const char *g_cfg_key[CFG_N] = { "takeover.bt", "takeover.fm", "takeover.aux", "lang" };
+/* 语言默认 0 = LANG_EN(英文)。改这个默认值等于改所有新用户的第一印象, 想清楚再动。 */
+static const int   g_cfg_def[CFG_N] = {  1,             0,             0,              0     };
+static int  g_cfg[CFG_N];
+static int  g_cfg_loaded = 0;
+
+static void cfg_load(void){
+    int fd, n, i, k;
+    char b[512];
+    for(i = 0; i < CFG_N; i++) g_cfg[i] = g_cfg_def[i];
+    g_cfg_loaded = 1;
+    fd = open(CFG_PATH, O_RDONLY, 0);
+    if(fd < 0) return;                       /* 没有文件 = 用默认值 */
+    n = (int)read(fd, b, sizeof b - 1);
+    close(fd);
+    if(n <= 0) return;
+    b[n] = 0;
+    for(i = 0; i < n; ){
+        int ls = i, eq = -1, j;
+        while(i < n && b[i] != '\n') { if(b[i] == '=' && eq < 0) eq = i; i++; }
+        if(i < n) b[i++] = 0; else b[n] = 0;
+        if(eq < 0) continue;
+        b[eq] = 0;
+        for(k = 0; k < CFG_N; k++){
+            const char *a = g_cfg_key[k], *c = b + ls;
+            for(j = 0; a[j] && c[j] && a[j] == c[j]; j++);
+            if(!a[j] && !c[j]){ char d = b[eq+1];
+                /* 认一位十进制数字(0..9), 不再只认 '1' —— 语言这类多值键要用。
+                 * 非数字一律当 0, 别把坏文件解释成某个意外的值。 */
+                g_cfg[k] = (d >= '0' && d <= '9') ? (d - '0') : 0; break; }
+        }
+    }
+}
+static void cfg_save(void){
+    char b[512]; int p = 0, i, fd;
+    for(i = 0; i < CFG_N; i++){
+        const char *k = g_cfg_key[i]; int j;
+        for(j = 0; k[j] && p < (int)sizeof b - 4; j++) b[p++] = k[j];
+        b[p++] = '='; b[p++] = (char)('0' + (g_cfg[i] % 10)); b[p++] = '\n';
+    }
+    fd = open(CFG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if(fd < 0){ plat_log("⚠ 设置存不下来: "); plat_log(CFG_PATH); plat_log("\n"); return; }
+    write(fd, b, (unsigned)p);
+    close(fd);
+}
+int plat_cfg_get(int key){
+    if(!g_cfg_loaded) cfg_load();
+    return (key >= 0 && key < CFG_N) ? g_cfg[key] : 0;
+}
+void plat_cfg_set(int key, int val){
+    if(!g_cfg_loaded) cfg_load();
+    if(key < 0 || key >= CFG_N) return;
+    g_cfg[key] = (val < 0 || val > 9) ? 0 : val;   /* 钳死: 坏值宁可回默认, 别写进文件 */
+    cfg_save();
+}
+
 void plat_log(const char *s){ fputs(s, stderr); }
 u16_ *plat_framebuf(void){ return g_fb; }
 
@@ -61,6 +126,7 @@ int plat_init(void){
     g_state.u_shuffle = 0; g_state.u_repeat = 2;
     g_state.freq_khz = 87500; strcpy(g_state.station, "FM 87.5");
     g_state.u_hour = 3; g_state.u_minute = 0; g_state.ignition = 1;
+    g_state.stock_page = -1; g_state.stock_src_slot = -1; g_state.stock_src_app = -1;
     /* 清空事件文件 */
     { char p[256]; snprintf(p,sizeof p,"%s/events",RUNDIR); FILE*f=fopen(p,"w"); if(f) fclose(f); }
     g_ev_pos = 0;
@@ -149,6 +215,11 @@ void plat_read_state(PcmState *st){
         g_state.u_battery    = read_int(js,"\"battery\"",   g_state.u_battery);
         g_state.u_shuffle    = read_int(js,"\"shuffle\"",   g_state.u_shuffle);
         g_state.u_repeat     = read_int(js,"\"repeat\"",    g_state.u_repeat);
+        /* 原厂状态镜像也要能在 Mac 上喂 —— 否则"音源不是蓝牙"这类**依赖原厂状态的分支**
+         * 在离线预览里永远走不到, 只能上台架才发现写错了。 */
+        g_state.stock_src_slot = read_int(js,"\"stock_src_slot\"", g_state.stock_src_slot);
+        g_state.stock_src_app  = read_int(js,"\"stock_src_app\"",  g_state.stock_src_app);
+        g_state.stock_page     = read_int(js,"\"stock_page\"",     g_state.stock_page);
         read_str(js,"\"device\"", g_state.device, sizeof g_state.device);
         read_str(js,"\"station\"",g_state.station,sizeof g_state.station);
     }
@@ -200,5 +271,10 @@ int plat_command(int cmd, int arg){
 }
 
 int plat_can_animate(void){ return 1; }   /* Mac 上一拍 33ms, 动画随便做 */
+
+/* Mac 上没有"让开屏幕"这回事 —— 浏览器里永远只有我们, 所以是空操作。
+ * ⚠️ 但**必须存在**: 外壳在 SOURCE 键上无条件调它, 少了这个函数 Mac 后端链接就断,
+ *   而那正是"一份源码两个后端"该在构建期发现的事。 */
+void plat_take_screen(void){ }
 
 #endif /* PLAT_MAC_C */

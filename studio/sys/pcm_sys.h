@@ -43,6 +43,10 @@ enum {
     K_MEDIA = 1, K_RADIO, K_NAV, K_PHONE, K_INFO, K_CAR, K_SETUP,
     K_BACK, K_OK, K_UP, K_DOWN, K_LEFT, K_RIGHT,
     K_PREV, K_NEXT, K_PLAY,
+    /* SOURCE 面板键。**目前唯一真的从原厂读到、并且我们真的处理的硬键**
+     * (2026-08-14 台架实证: 映射器 +0x64 键码 + +0x6c 沿)。
+     * 它是我们让开屏幕之后被叫回来的唯一入口, 所以外壳把它当全局导航键处理。 */
+    K_SOURCE,
 };
 
 typedef struct {
@@ -182,14 +186,37 @@ void plat_read_state(PcmState *st);
  *   CMD_SEEK 曾经在这儿, 旁边写着"蓝牙下预期失败, 别进主路径"。
  *   注释拦不住任何人: 只要它存在, 就总有人会去做拖动进度条。2026-08-14 删掉。
  *   理由和证据在 pcm_caps.h 的 CAP_SEEK。要加回来, 先把 CAP_SEEK 改成 1 并附真机实证。 */
-enum { CMD_PLAY=1, CMD_PAUSE, CMD_NEXT, CMD_PREV, CMD_SET_VOLUME, CMD_SET_SOURCE,
+enum { CMD_PLAY=1, CMD_PAUSE, CMD_NEXT, CMD_PREV, CMD_SET_VOLUME,
+       CMD_SET_SOURCE,  /* arg = **SRC_***(不是原厂槽号 —— 槽号是平台细节) */
        CMD_TUNE,        /* 收音机: 调到 arg kHz */
        CMD_SET_SHUFFLE, /* arg 0..4 —— **值域在 plat 层钳死**, 服务端不做上界检查 */
        CMD_SET_REPEAT };
 int  plat_command(int cmd, int arg);
+
+/* 把屏幕收回来(我们盖上去)。用户按 SOURCE 键时外壳调它 ——
+ * 让开状态下这是唯一的回头路。Mac 后端是空操作(那边永远"盖着")。
+ * ⚠️ 只管显示归属, **不发任何命令** —— 发命令仍然要过 plat_command 的守卫。 */
+void plat_take_screen(void);
 /* 🚨 触摸门 / 内存探针这些**引擎内部**的东西已经搬到 sys/plat_internal.h ——
  *   场景层看不到它们。触摸门是引擎维护的**不变式**(盖着⟺装着), 不是谁想调就能调的开关;
  *   一旦某个场景自己去 arm/disarm, 那条不变式就没人说得清了。 */
+
+/* ================= 设置(持久化) =================
+ * 🚨 为什么放平台层而不是场景层: 它要落盘, 而两个后端落的地方不一样
+ *   (真机 /HBpersistence/dev/etc/studio.conf, Mac /tmp/pcm_studio/studio.conf)。
+ *   场景只管问"这一项开着吗"和"把它设成 X", 不关心存在哪。
+ *
+ * 📌 **接管开关只管媒体页**(蓝牙/FM/AUX)。音源页永远是我们的, 不可关 ——
+ *   装了 Studio 就是要替换它, 那是这个项目的前提, 不是一个选项。
+ *   所以在设置页里关掉某一项**不会把你从当前页面踢走**(你人在设置页, 它不是媒体页)。 */
+enum { CFG_TAKEOVER_BT = 0, CFG_TAKEOVER_FM, CFG_TAKEOVER_AUX,
+       CFG_LANG,      /* 界面语言, 见 pcm_i18n.h 的 LANG_*。**默认英文**(用户 2026-08-14 定) */
+       CFG_N };
+/* 🚨 值域是 **0..9 的小整数**, 不是布尔。原来这里(以及落盘格式)写死成 0/1,
+ *   加语言那天才发现整条链都要改 —— 现在放宽了, 以后加"第三种语言/三态开关"不用再动一次。
+ *   接管类的键仍然只用 0/1, 那是**用法**, 不是类型限制。 */
+int  plat_cfg_get(int key);            /* 没有配置文件时返回默认值 */
+void plat_cfg_set(int key, int val);   /* **立刻落盘** —— 改了没保存比没改更糟 */
 
 /* 毫秒时钟(动画/生命周期用) */
 unsigned plat_now_ms(void);

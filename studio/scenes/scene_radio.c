@@ -87,7 +87,7 @@ static void radio_render(u16_ *fb, const PcmState *st, unsigned t_ms){
         int x = radio_draw_freq(56, 84, freq, 3, R_INK);
         gfx_text(x + 14, 84 + 34, "MHz", 1, R_INK2);
     } else {
-        gfx_text(56, 84 + 20, "读取中", 2, R_INK3);
+        gfx_text(56, 84 + 20, T(STR_READING), 2, R_INK3);
     }
     /* 台名: **故意没有**。见文件头说明 —— RDS 台名拿不到, 不留位置也不编。 */
 
@@ -162,10 +162,10 @@ static void radio_render(u16_ *fb, const PcmState *st, unsigned t_ms){
             gfx_text(x+18+gfx_text_w(b,1)+4, PC_Y+32, "AM", 1, 97,106,121);
         }
         else if(khz > 0) radio_draw_freq(x+18, PC_Y+30, khz, 1, on?243:154, on?245:163, on?249:178);
-        else             gfx_text(x+18, PC_Y+34, "空", 1, 78,88,105);
+        else             gfx_text(x+18, PC_Y+34, T(STR_EMPTY), 1, 78,88,105);
     }
 
-    gfx_text(56, SCR_H-38, "旋钮调台 · 确定选择预设", 1, R_INK3);
+    gfx_text(56, SCR_H-38, T(STR_FM_HINT), 1, R_INK3);
 }
 
 static int radio_event(const PcmEvent *ev, const PcmState *st){
@@ -210,7 +210,7 @@ static int radio_event(const PcmEvent *ev, const PcmState *st){
 }
 
 static const PcmScene SCENE_RADIO = {
-    "radio", "收音机", 0, 0, radio_render, radio_event
+    "radio", STR_RADIO, 0, 0, radio_render, radio_event
 };
 
 #endif /* SCENE_RADIO_C */

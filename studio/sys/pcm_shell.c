@@ -12,13 +12,16 @@
 #define PCM_SHELL_C
 
 #include "pcm_sys.h"
+#include "pcm_i18n.h"   /* 界面文案唯一出处; 场景经由本文件间接拿到 T() */
 
 #define MAX_SCENES 16
 #define NAV_DEPTH  8
 
 typedef struct PcmScene {
     const char *id;                               /* 场景标识, 例 "btplay" */
-    const char *title;                            /* 显示名 */
+    int title;                                    /* 显示名的**文案 id**(STR_*), 不是字符串 ——
+                                                   * 表是 static const, 存字符串就得在编译期定死语言。
+                                                   * ⚠️ 目前全树没有任何地方读它; 保留是因为它零成本且类型正确。 */
     void (*enter)(void);                          /* 进入(可选) */
     void (*leave)(void);                          /* 离开(可选) */
     void (*render)(u16_ *fb, const PcmState *st, unsigned t_ms);  /* 画一帧(必需) */
@@ -125,7 +128,7 @@ static void shell_goto(const char *id){
     int idx = shell_find(id);
     if(idx < 0){
         plat_log("scene not found: "); plat_log(id); plat_log("\n");
-        shell_toast("这个页面还没做");
+        shell_toast(T(STR_NOT_BUILT));
         return;
     }
     shell_goto_idx(idx, 1);
@@ -153,7 +156,7 @@ static int shell_global_key(const PcmEvent *ev){
         case K_MEDIA: shell_goto("btplay"); return 1;
         case K_RADIO: shell_goto("radio");  return 1;
         case K_SETUP: shell_goto("settings"); return 1;
-        case K_CAR:   shell_goto("home");   return 1;
+        case K_CAR:   shell_goto("source"); return 1;   /* 原来叫 home; 它就是音源页 */
     }
     return 0;
 }
@@ -175,6 +178,16 @@ static int shell_tick(void){
     /* 1. 吃掉所有待处理事件 */
     while(plat_poll_event(&ev)){
         if(ev.type == EV_NONE) continue;
+        /* 🔓 SOURCE 键**在场景之前处理, 任何场景都不许吞掉它**。
+         *   它是我们让开屏幕之后被叫回来的唯一入口 —— 一旦某个场景把它当自己的键消费掉,
+         *   用户就再也回不来了, 而且这种"某个页面按 SOURCE 没反应"极难归因。
+         *   所以它不走 shell_global_key(那条路是场景优先), 直接在这儿截。 */
+        if(ev.type == EV_KEY_DOWN && ev.arg == K_SOURCE){
+            plat_take_screen();          /* 让开中的话先把屏幕收回来 */
+            shell_goto("source");
+            g_dirty = 1; g_dirty_full = 1;
+            continue;
+        }
         sc = shell_current();
         /* 先给场景, 场景不要再走全局 */
         if(!(sc && sc->on_event && sc->on_event(&ev, &st)))

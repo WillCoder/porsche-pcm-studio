@@ -54,7 +54,7 @@ static void aux_render(u16_ *fb, const PcmState *st, unsigned t_ms){
      * 视觉上也更像一套系统: 一个座舱只有一个光源。改这个数之前先想清楚这一点。 */
     gfx_backdrop(A_BG0, A_BG1, 180, 140, 330, 58,120,190, 0);
 
-    gfx_text(56, 56, "AUX 输入", 2, A_INK);
+    gfx_text(56, 56, T(STR_AUX_TITLE), 2, A_INK);
 
     /* 左: 大图块 */
     gfx_rrect(56, 120, 280, 280, 28, A_TILE);
@@ -63,10 +63,10 @@ static void aux_render(u16_ *fb, const PcmState *st, unsigned t_ms){
     /* 右: 状态 */
     {
         int x = 392;
-        gfx_text(x, 150, "外部音源", 2, A_INK);
-        gfx_text(x, 200, st->source == SRC_AUX ? "已选中 AUX" : "当前不是 AUX",
+        gfx_text(x, 150, T(STR_AUX_SUB), 2, A_INK);
+        gfx_text(x, 200, st->source == SRC_AUX ? T(STR_AUX_ON) : T(STR_AUX_OFF),
                  1, st->source == SRC_AUX ? A_INK2 : A_INK3);
-        gfx_text(x, 236, "AUX 没有曲目信息, 只能调音量", 1, A_INK3);
+        gfx_text(x, 236, T(STR_AUX_HINT), 1, A_INK3);
 
         /* 音量条 —— 这一页唯一真正的控制维度 */
         {
@@ -75,7 +75,7 @@ static void aux_render(u16_ *fb, const PcmState *st, unsigned t_ms){
             gfx_pill(x, by, bw, bh, 45,55,72);
             if(v > 0) gfx_pill(x, by, bw*v/40, bh, A_AMBER);
             gfx_circle(x + bw*v/40, by + bh/2, 9, 250,250,252);
-            gfx_text(x, by + 30, "音量", 1, A_INK3);
+            gfx_text(x, by + 30, T(STR_VOLUME), 1, A_INK3);
             {   /* 数值 */
                 char b[4]; int p=0, n=v;
                 if(n >= 10){ b[p++]=(char)('0'+n/10); }
@@ -95,7 +95,7 @@ static int aux_event(const PcmEvent *ev, const PcmState *st){
 }
 
 static const PcmScene SCENE_AUX = {
-    "aux", "AUX", 0, 0, aux_render, aux_event
+    "aux", STR_AUX, 0, 0, aux_render, aux_event
 };
 
 #endif /* SCENE_AUX_C */

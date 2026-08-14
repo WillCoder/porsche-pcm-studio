@@ -1,16 +1,23 @@
 # porsche-pcm-studio
 
-**A replacement media UI for the 2009 Porsche PCM 3.1 — self-drawn, running beside the stock firmware, with zero flash writes**
+**A replacement media UI for the 2009 Porsche PCM 3.1 — self-drawn, running beside the stock firmware**
 
 > Porsche PCM 3.1 (CHN) · QNX 6.3.2 · SH-4A · 800×480 · 2026-08
 > **✅ Running on a bench unit: real track metadata, real transport control, real touch.**
 >
 > **English** · [简体中文](README.zh-CN.md)
 
-> ⚠️ **Disclaimer**: For study/research only. This project itself writes **nothing** to flash — every
-> change lives in RAM and is gone at the next power cycle — but it does read and write another
-> process's memory on a car computer. **Use at your own risk; don't blame me.**
+> ⚠️ **Disclaimer**: For study/research only. It reads and writes another process's memory on a car
+> computer. **Use at your own risk; don't blame me.**
 > 仅供学习研究,后果自负。 Full text: [DISCLAIMER.md](DISCLAIMER.md) · License: [GPL-3.0](LICENSE)
+
+> 🚩 **About "zero flash": read this before you believe the phrase.** An earlier version of this
+> README claimed the project writes nothing to flash. That was **wrong**, and it is corrected below.
+> The UI, the state reading and the Bluetooth transport controls really do need no flash writes.
+> But **volume, source switching and tuner control drive the stock firmware's own control plane
+> through a code cave that has to be flashed into IFS1 first** (from the sibling project's toolkit).
+> Without that cave those three return an error; everything else still works. See
+> [What needs a flashed cave](#what-needs-a-flashed-cave).
 
 ![PCM Studio running on the bench](images/01-bench-btplay.jpg)
 
@@ -28,18 +35,45 @@ Bluetooth stack, the tuner and the persistence store. Studio replaces only what 
 
 That choice is the whole design:
 
-- **Zero flash writes.** Nothing is reflashed, nothing is patched on disk. Kill the process or cut
-  power and the stock UI is back, untouched.
+- **Studio itself is a normal process.** It reflashes nothing and patches nothing on disk. Kill it or
+  cut power and the stock UI is back, untouched.
 - **No forked firmware to maintain.** We read the stock software's state instead of reimplementing it.
 - **The stock unit stays authoritative.** Volume, sources, tuner presets, phone book — all still the
   factory implementation. We are a presentation layer.
+
+## What needs a flashed cave
+
+Being a presentation layer has a limit: to *change* something (not just show it) we have to reach the
+stock firmware's control plane, and some of that is only reachable from inside the stock process.
+
+| | How it works | Needs flash? |
+|---|---|---|
+| Full-screen overlay, own hardware layer | second `gf` client | **no** |
+| Reading stock state (page id, source, volume, track) | read-only `/proc/<pid>/as` mirror | **no** |
+| Bluetooth play/pause, prev/next, shuffle, repeat | MME protocol, direct | **no** |
+| Touch gate (stop the stock seeing touch) | one word in the stock's memory | **no** |
+| Reading hard keys | read the stock's key mapper | **no** |
+| **Volume** | stock control plane via a code cave | **yes — IFS1** |
+| **Source switching** | stock control plane via a code cave | **yes — IFS1** |
+| **Tuner (set frequency)** | stock control plane via a code cave | **yes — IFS1** |
+
+The cave is not part of this repo — it is flashed by the sibling project
+[porsche-pcm31-mods](https://github.com/WillCoder/porsche-pcm31-mods). Without it, those three
+commands return an error and log it; the rest of the UI is unaffected.
+
+`studio/platform/puppet_addr.h` holds the addresses of that cave. **They are specific to one
+firmware build on one bench unit** — they are published so the code compiles and so the mechanism is
+readable, not so you can flash them somewhere else.
 
 ## Status
 
 | Area | State |
 |---|---|
 | Bluetooth playback page | **Working on the bench** — metadata, progress, play/pause, prev/next, shuffle, repeat, touch |
-| Radio / AUX / home / settings pages | Skeletons, layout only |
+| Source page | **Working on the bench** — the SOURCE hard key brings it up from anywhere; tapping a card really switches the source (that part needs the flashed cave) |
+| Settings | **Working** — per-source "Studio takes over" toggles + language, written to disk immediately |
+| Languages | **English (default)** and Simplified Chinese, switched live |
+| Radio / AUX pages | Skeletons, layout only |
 | Real car (911 / 9x1) | **Not yet tried.** Bench only so far |
 | Album art | **Impossible** over AVRCP 1.3 — see [docs/capabilities.md](docs/capabilities.md) |
 
