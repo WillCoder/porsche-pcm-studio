@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.fseventsd
+
+# editor
+*.swp
+*~
+.vscode/
+.idea/
+
+# build products
+*.o
+*.stripped
+studio/pcm_studio
+/build/
+
+# ── baked fonts are NOT committed ──────────────────────────────────────────
+# They are derivatives of Noto Sans SC (SIL OFL). Redistributing a 3.8 MB
+# rasterised subset adds a licensing question for no benefit: the baker and the
+# exact recipe are in studio/tools/bake_font.py, so anyone can reproduce it
+# byte-for-byte in one command. See docs/build-and-deploy.md.
+*.fnt
+references/fonts/
+
+# ── firmware NEVER goes in this repo ───────────────────────────────────────
+# Modified proprietary Porsche firmware. Same rule as porsche-pcm31-mods.
+*.ifs
+*.decomp
+PCM3Root*
+PCM3Reload*
+firmware-cache/
