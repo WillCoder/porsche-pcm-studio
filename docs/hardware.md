@@ -52,16 +52,39 @@ real bricking risk, and neither is undone by a power cycle.
 | gf | hw | Bench census (221 s) | Verdict |
 |---|---|---|---|
 | gf1 | L6 | 0 changes, "placeholder, unused" — the only idle RGB layer | **First choice** (`plat_pcm.c:372`) |
-| gf5 | L2 | Stock transition/overlay layer; stock writes L3's full-screen surface here on page changes | Fallback |
+| gf5 | L2 | Stock transition/overlay layer; stock writes L3's full-screen surface here on page changes | **Never selected** (was a fallback until 2026-08-17) |
 | gf6 | L1 | **Video capture layer.** Driver writes `L1EM bits[1:0]`, *Reserved* on L1 (manual p.412) → top 6 bits die, red never appears | **Do not use** |
-| gf7 | L0 | Stock content, 800 × 480, 8 changes | Last-resort fallback |
+| gf7 | L0 | Stock content, 800 × 480, 8 changes | **Never selected** (was a fallback until 2026-08-17) |
 
-The fallback list is `int pref[3] = {1,5,7}` (`plat_pcm.c:372`). Both `layermanager.cfg` images we hold carry `lastAvailableLayer=0-4`, so the LM pool is
-gf4..gf7 = hw L3..L0: gf5 and gf7 sit inside it, only gf1 is outside. Those two images (a 911 and a bench-variant build) are byte-identical ⇒ **no evidence the
-layer map varies by model**, but no live census has run on a car — which is what §7 covers.
+**The candidate list is now `gf1` alone** — the two fallbacks were removed on 2026-08-17 after a bench run
+landed on gf5 and drew there quite happily. The occupancy check that allowed it asks whether anything is
+scanning the layer *at this instant*; it cannot see that the stock will want its transition layer back on the
+next page change. A fallback that is empty right now and claimed a second later is not a fallback, it is the
+exact class of accident the yield protocol exists to prevent — so the honest behaviour when gf1 is unavailable
+is to display nothing and say so in the log.
+
+Both `layermanager.cfg` images we hold carry `lastAvailableLayer=0-4`, so the LM pool is gf4..gf7 = hw L3..L0:
+gf5 and gf7 sit inside it, only gf1 is outside. Those two images (a 911 and a bench-variant build) are
+byte-identical ⇒ **no evidence the layer map varies by model**, but no live census has run on a car — which is
+what §7 covers.
 
 **Z-order: append yourself last.** `gf_display_set_layer_order` takes an 8-entry array, last = topmost, and it must be fully initialised (the library reads all
 8). With our gf layer appended last, a full-screen opaque surface covers the stock page: 24 000 sampled points, zero stock pixels (`plat_pcm.c:427`).
+
+**Layer selection now gates on occupancy.** Before attaching a candidate, Studio reads its
+`/gdc_shm_inform` record and skips anything that is 800×480 *and* carries a real buffer — the same
+test the older overlay used, ported across on 2026-08-15 after an audit found Studio had no
+occupancy check at all and would attach to, and immediately disable, whatever it landed on. Studio is
+itself 800×480, so the cost is explicit and accepted: after a crash its own residue reads as "someone
+is scanning this", the layer is skipped, and Studio does not run again until a power cycle. When
+"stock is using it" and "our own corpse" are indistinguishable, not stealing the layer is the only
+safe answer on a car. If no candidate passes, startup aborts rather than falling through.
+
+The startup residue purge also issues a zeroed `set_blending` **before** its `disable`/`update`.
+Ordering matters: the server's commit walks every dirty bit of that hardware layer including the
+blend bit, and it does not care who set it — so an `update` issued while a previous owner's non-zero
+blend config is still pending would commit *their* config and allocate an alpha plane that the
+firmware can never return (§ the PDC failure). Committing our zeros first makes that impossible.
 
 **`enable` is gated, not unconditional.** `push_layer()` returns 0 and refuses to light the layer
 while we are covering but the first frame is not yet in the surface — lighting it early shows whatever

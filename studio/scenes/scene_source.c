@@ -204,7 +204,11 @@ static int src_card_hit(int x, int y){
  *   (cave 没武装 / 队列还占着 / 音源号不在表里)都只是返回 -1 ——
  *   不提示的话用户看到的就是"点了没反应", 而这是最难描述也最难归因的故障。
  *   宁可弹一句难看的提示, 也不要装作什么都没发生。 */
-static void src_pick(int i){
+static void src_pick(int i, const PcmState *st){
+    /* 点的就是**当前正在用的源**: 不用切(切了原厂页也不会动), 直接请路由重判一次,
+     * 由它按接管开关决定是进我们的页、还是让开显示原厂。
+     * 2026-08-17 用户报的 bug 就是这条路径缺失 —— 源已经是蓝牙时再点蓝牙, 毫无反应。 */
+    if(SRC_CARDS[i].src == st->source){ shell_request_reroute(); return; }
     if(plat_command(CMD_SET_SOURCE, SRC_CARDS[i].src) != 0)
         shell_toast(T(STR_SRC_FAIL));
 }
@@ -219,7 +223,7 @@ static int source_event(const PcmEvent *ev, const PcmState *st){
             shell_goto("settings"); return 1;
         }
         i = src_card_hit(ev->x, ev->y);
-        if(i >= 0){ src_pick(i); return 1; }
+        if(i >= 0){ src_pick(i, st); return 1; }
     }
     return 0;
 }

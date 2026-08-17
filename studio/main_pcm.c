@@ -120,7 +120,23 @@ int main(void){
     /* -2 = 单实例锁不在手里(结构性错误, 空转只会掩盖它); 其余 = 硬件起不来, 空转等人来看日志。 */
     { int r = plat_init();
       if(r == -2){ plat_log("平台拒绝启动 -> 退出\n"); return 1; }
-      if(r != 0){ plat_log("平台起不来, 空转\n"); for(;;) usleep(5000000); } }
+      if(r != 0){
+          /* 🚨 2026-08-17 台架实测, 这里改了两轮, 最终结论是**退出**, 不是空转。
+           * 第一版: `for(;;) usleep(...)` 死等, **连停止开关都不查** ——
+           *   `touch /tmp/studio.stop` 停不掉(而 KB 明令别 slay ⇒ 用户没有正当手段结束它),
+           *   还占着单实例锁, 修好条件也起不了新实例。
+           * 第二版: 空转但可停。台架验过能停了, **可是自启场景下照样是死局** ——
+           *   守护循环靠 `pidin` 判存活, 一个"活着但什么都不做"的进程会让它永远不重启,
+           *   现象是**进程列表里有 studio, 而屏幕上什么都没有, 直到断电**。
+           * ⇒ 最终: **直接退出**。原来"空转等人来看日志"的理由(退出会让现场一起消失)
+           *   经不起推敲 —— 日志是 /tmp/studio.log 这个**文件**, 退出后好端端在那儿,
+           *   自启脚本还会把它抄进 /HBpersistence。而退出换来三件实在的:
+           *     ① 锁立刻释放; ② 守护循环看得见它没了, 按退避重试;
+           *     ③ 重试是**有意义的** —— 认领登记簿在 /tmp, 崩溃后重启能认回自己那块层。 */
+          plat_log("平台起不来 -> 退出(原因见上面的 ABORT; 锁已释放, 自启会按退避重试)\n");
+          plat_shutdown();
+          return 1;
+      } }
     shell_register(&SCENE_SOURCE);
     shell_register(&SCENE_BTPLAY);
     shell_register(&SCENE_RADIO);
@@ -189,7 +205,11 @@ int main(void){
         {
             static int last_page = -1;
             PcmState ps; plat_read_state(&ps);
-            if(ps.stock_page != last_page && ps.stock_page >= 0){
+            /* `force` = 场景请求重判(见 shell_request_reroute)。
+             * 页 id 没变也要重判的唯一场景: 用户点了**已经是当前源**的那张卡 ——
+             * 那时原厂页不会动, 但用户明确表达了"我要看这个源"。 */
+            int force = shell_take_reroute();
+            if((ps.stock_page != last_page || force) && ps.stock_page >= 0){
                 /* 🔑 **"谁显示"只在这一处决定。** 场景点了卡片只负责真切源(CMD_SET_SOURCE),
                  *   原厂自己走完后续并切它的页, 页 id 一变就走到这里。
                  *   两边各判一次的话迟早打架, 而且"为什么这页是原厂的"会变得没人说得清。

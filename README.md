@@ -21,6 +21,13 @@
 
 ![PCM Studio running on the bench](images/01-bench-btplay.jpg)
 
+![The source page on the bench unit](images/02-bench-source.jpg)
+
+*The source page, photographed on the bench unit. Studio started itself at power-on; the picture was
+taken after one press of the physical SOURCE key. Radio is the active source (amber icon and dot);
+Bluetooth is ours, Radio and AUX are handed back to the stock UI because their takeover switches are
+off. Everything above the buttons is drawn by Studio on its own hardware layer.*
+
 *Bench unit, Bluetooth playback page. Track name, artist, album, genre, elapsed/total and the phone's
 name are all read live from the stock firmware; the transport buttons drive it back over MME.*
 

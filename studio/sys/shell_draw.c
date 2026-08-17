@@ -140,7 +140,14 @@ static int shell_statusbar(const PcmState *st, int x_right, int r, int g, int b)
      * 🚨 数字用**固定宽度的槽**右对齐(按 "88" 的宽度), 不能按实际宽度排 ——
      *   否则音量从 9 跳到 10 的时候, 左边的横条和喇叭会跟着**整体位移**, 看起来像画面在抖。 */
     if(st->volume >= 0){
-        const int VW = 40, VH = 3;
+        /* 🚨 2026-08-17 用户实测: "拧音量的时候滚动条不动"。
+         *   查下来**不是不动, 是一格只动 1 个像素** —— 条宽 40px 而量程是 0..40 格。
+         *   而且实际可用区间约 4..20, 所以它永远只填到四成以内, 更看不出变化。
+         *   ⇒ 加宽到 120px = **3px 一格**, 拧几下就明显。数字给精确值, 条给量感,
+         *     两个都要能履行自己的职责。
+         *   ⚠️ 别再往宽了改: 蓝牙页的设备名是按 `shell_statusbar` 的返回宽度算剩余空间的,
+         *     这条越宽, 那边越早被截断(120px 时还剩约 372px, 够)。 */
+        const int VW = 120, VH = 3;
         int slot = sb_text_w("88");
         int fill = st->volume > 40 ? VW : st->volume * VW / 40;
         int by = SB_ICY - VH/2;

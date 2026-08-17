@@ -273,6 +273,16 @@ Measured ids: FM = slot 11 / app 1, AUX = 26 / 6, Bluetooth = 40 / 7; `app` is t
 discriminator. Page id `0xFFFE` is a page-transition sentinel and must be ignored. **A whitelist,
 not a pattern** — "three digits means media" was disproved by page 913.
 
+**Studio does not cover the screen until it has read a stock page id.** `g_cover` starts at 0, so a
+freshly started instance shows nothing and the stock UI is untouched; the page router turns covering
+on once it recognises a page. This matters most at boot: handing back the screen requires a valid
+page id, so an instance that never anchors would otherwise cover the display for the whole ignition
+cycle — including while the driver is reversing. For the same reason the anchoring retry no longer
+gives up permanently after ~30 s; it backs off to one attempt every 30 s and keeps trying.
+
+Yield protection is also **fail-closed**: if the layer record cannot be read there is no way to tell
+whether the stock has taken the layer, and startup aborts rather than running blind.
+
 `plat_poll_event()` sources touch from the read-only mirror, the SOURCE hard key (§4.5), and a
 debug injection file (`echo "<type> <which> <arg> <x> <y>" > /tmp/studio_ev`). The FPGA/IPC path
 is still **not connected** — polling shared IPC channels has hung both a car and a bench unit —

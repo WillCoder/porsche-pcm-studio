@@ -163,6 +163,20 @@ Bench shell limits, worth re-checking on your own unit before scripting: `head`,
 
 **⑥ Never run two studios.** The second one's startup `disable + update` pulls the layer out from under the first, whose next `gf` call then blocks on the graphics server; the survivor cannot be stopped by `/tmp/studio.stop` and the unit needs a power cycle. It is worse than a crash because the symptoms look like something else entirely: a command file that empties with nothing responding, or a startup log with the `ck` line missing, because `plat_log` truncates per process and the refusing instance would otherwise wipe the live one's log. Studio now takes a single-instance lock at `/tmp/studio.lock` as its very first action and `gostudio` refuses to launch over a running instance — but only if you start it through `gostudio`.
 
+## 5.5 Starting at boot
+
+The stock process table already contains an entry that runs `/proc/boot/ksh /HBpersistence/debugTools.sh` in the background, and **that file does not exist on a stock unit** — the boot log has always said so. Creating it is the entire install; deleting it is the entire uninstall. No firmware image, no checksum, no raw-partition write. The repository copy is `dev/bench/studio_autostart.sh` (deliberately *not* named `debugTools.sh`, because the old volume-OSD engine ships a file by that name and one machine can only have one of them — they are mutually exclusive by construction).
+
+The hook runs as process #34 while `layermanager` is #46 and `gdcServerCarmine` is #56, so the script polls for gdc before touching anything graphical. It also writes **both** `/tmp/p3pid` and `/tmp/rlpid`: the stock hook writes only the first, and an instance missing the second comes up looking healthy while its page id stays −1 forever. A kill switch at `/HBpersistence/studio/DISABLE` stops it without deleting anything, and it lives on persistent storage on purpose — a switch in `/tmp` would un-set itself at the next power cycle.
+
+The respawn guard has one deliberate dead end worth knowing about. Because layer selection skips any 800×480 candidate that has a real buffer, and Studio is itself 800×480, a crashed instance's residue reads as "occupied" — so the respawned instance finds no free layer, logs it, and exits. The guard then backs off to 30 s and keeps trying without effect until the next power cycle. That is the intended trade: not stealing a layer beats recovering the UI.
+
+**Verified on the bench on 2026-08-17**, end to end: power on → the hook waits for `gdcServerCarmine` → Studio starts about ten seconds in, takes gf1 while it is still untouched, registers its claim, and leaves the screen to the stock UI. One press of the physical SOURCE key hands the screen over in 221 ms. The old volume-OSD engine never starts, because one machine can only have one `debugTools.sh`.
+
+The same session found three real defects that only a running unit could have shown, all fixed and re-verified: a watchdog that killed the process silently because it was armed unconditionally but only refreshed while the touch gate was armed; a layer-occupancy check that could not recognise its own residue, so Studio could start exactly once per power cycle; and an init-failure path that idled forever without honouring the stop switch, which held the singleton lock and made the respawn guard believe Studio was alive.
+
+**Still true: none of this has run in a car.** Everything above is a bench result. Three of the guards added that day — the yield gate, fail-closed yield startup, and the anchoring backoff — are covered only by their boot self-checks and build lints; no normal code path has triggered them.
+
 ## 6. Running and stopping
 
 ```sh
@@ -170,6 +184,12 @@ Bench shell limits, worth re-checking on your own unit before scripting: `head`,
 ```
 
 `gostudio` is the **only** supported way to start it. It resolves the PIDs of `PCM3Root` and `PCM3Reload` with `pidin` into `/tmp/p3pid` and `/tmp/rlpid` (**never hard-code PIDs** — a stale one silently reads another process; `/tmp` is cleared on every boot, and the stock autostart hook writes only `p3pid`, so a studio started any other way comes up half-blind with page id stuck at −1); **refuses to start if a studio is already running**; clears `/tmp/studio.stop`; takes an optional mode argument (`gostudio 2` for mirror mode); and launches with all three standard streams redirected: `on -d /HBpersistence/dev/bin/studio </dev/null >/dev/null 2>/dev/null`. The redirection is mandatory — the graphics library prints to stdout on connect, and with an undrained console that single write blocks the process forever and looks exactly like "the gf call hangs" (Trap ①).
+
+**The compiled default is mode 1 (the real UI).** It used to be mode 0, the full-screen colour test
+pattern — which was fine while the only way to start Studio was by hand, and a latent disaster for
+booting it automatically: `/tmp` is empty at boot, so a missing `/tmp/studio_mode` meant the car
+would come up showing colour bars. What appears on the screen should not depend on whether an
+external file happens to exist. The self-test is now opt-in (`echo 0 > /tmp/studio_mode`).
 
 Startup mode comes from `/tmp/studio_mode`, re-read **every tick** from the main loop (`main_pcm.c:198`, `plat_pcm.c:178-185`); read inside `plat_present()` it would never run once the screen goes idle, because the shell only presents when dirty. Mode `0` (default) is a self-test image — corner primaries, white border, moving square, which proves layer, colour channels and geometry before you debug content. Mode `1` is the real UI. Mode `2` is mirror mode: it reads stock state and logs it but **does not take the screen**, so you can watch the stock UI while calibrating page ids and sources.
 

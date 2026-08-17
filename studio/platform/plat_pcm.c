@@ -87,6 +87,13 @@ extern int  getpid(void);
 #define SIGQUIT 3
 #define SIGABRT 6
 extern unsigned alarm(unsigned sec);
+/* 🐕 看门狗秒数。**装它的地方和续它的地方必须用同一个常量** —— 两处写不同的数
+ *   就会变成"偶尔被自己打死", 而那是最难查的一类。
+ * 为什么是 5 不是 3: 锚定要扫 16MB(locate_menumgr)和读 3.75MB(locate_v4),
+ *   单拍可能到秒级。看门狗是抓 REPLY-block 死锁的, 5 秒和 3 秒对那个目的没区别,
+ *   但对"别误杀正在扫描的自己"区别很大。 */
+#define WATCHDOG_SEC 5u
+#define PANIC_EXIT_SEC 2u   /* 崩溃处理器里"归还图层"那两步的硬超时, 与看门狗无关 */
 extern void (*signal(int, void (*)(int)))(int);
 extern void exit(int);   /* 桩 libc 里没有 _exit, 隔壁 coexist_pop 也是用 exit */
 extern int  devctl(int fd, int cmd, void *d, unsigned n, unsigned *i);
@@ -269,7 +276,12 @@ static int  g_bench_done = 0;
  *            才知道自己切到哪儿了。2026-08-05 用户实测反馈: 盲操作根本分不清 FM 还是 AUX。
  *   串口: echo 0 > /tmp/studio_mode  /  echo 1 > /tmp/studio_mode  (下一帧生效)
  *   默认 0(自检) —— 宁可第一次多一步, 也别拿黑屏猜。 */
-static int g_mode = 0;
+/* 🚨 2026-08-15 把默认从 0(自检彩条)改成 1(真界面)。
+ * 原因: 开机自启时 /tmp 是空的 ⇒ /tmp/studio_mode 不存在 ⇒ read_mode 提前返回 ⇒
+ * 默认值就是屏幕上真正会出现的东西。默认 0 意味着**车一启动就是整屏彩条**。
+ * "屏幕上出现什么"这件事不该依赖一个外部文件存不存在。
+ * 自检图现在是显式 opt-in: `echo 0 > /tmp/studio_mode`(gostudio 0 也行)。 */
+static int g_mode = 1;
 /* 🚨 必须在**主循环每拍**调, 不能放在 plat_present 里面 ——
  *   外壳是"只有 dirty 才重画", 首页画完一次就不脏了, present 从此不再被调用,
  *   于是模式开关永远读不到(2026-08-05 台架实测: 写了 /tmp/studio_mode 屏幕纹丝不动,
@@ -377,15 +389,63 @@ static int read_layer_fp(u32 *fmt, u32 *sz){
  *   修: 两个 bank 各学一份指纹 —— **刚推完的那一帧读到的, 按定义就是我们自己的**。
  *       两份都对不上才算被抢。fmt 仍然逐位比(格式/pitch/高度变了才是真被抢)。 */
 static u32 g_fp_sz_bank[2] = {0, 0};
+static u32 g_claim_a[2] = {0, 0};      /* 我们两个 bank 的物理地址(写进认领登记簿) */
+/* 📒 **认领登记簿 `/tmp/studio.claim`** —— 解决"占用闸门认不出自己的尸体"。
+ * 2026-08-17 台架实测暴露的问题: 闸门判据是"800x480 + 有真缓冲 = 有人在扫", 而我们
+ * **自己也是** 800x480; 层记录里的缓冲地址在我们退出后**不会复位**(gf 没有归还语义)。
+ * ⇒ 连 `touch /tmp/studio.stop` 干净停掉再起都抢不到层 —— **一个上电周期只能起一次**。
+ * 那不是"崩溃后不恢复"的取舍, 是重启根本不可能, 台架开发直接没法做。
+ *
+ * 解法: 我们**知道自己用的是哪块地址**。跑起来就把 (gf号, 两个 bank 的物理地址) 写进
+ * `/tmp/studio.claim`; 下次启动时, 候选层的地址若命中登记簿, 那就是**我们自己的残留**,
+ * 可以放心接管。命中不了的才是原厂在用 —— 那个照旧不碰。
+ * 🔑 放 /tmp 是故意的: 它每次上电清空, 而 alpha 平面池、层记录也都是上电才复位 ——
+ *    登记簿的生命周期必须和它描述的硬件状态**同生共死**, 放持久盘反而会骗人。 */
+static void claim_write(void){
+    int fd; char b[64]; int n = 0; int i; u32 v[3];
+    if(g_lidx < 0) return;
+    v[0] = (u32)g_lidx; v[1] = g_claim_a[0]; v[2] = g_claim_a[1];
+    for(i = 0; i < 3; i++){
+        int sh; if(i){ b[n++]=' '; }
+        for(sh = 28; sh >= 0; sh -= 4){ int d = (int)((v[i] >> sh) & 0xf);
+            b[n++] = (char)(d < 10 ? '0'+d : 'a'+d-10); }
+    }
+    b[n++] = '\n';
+    fd = open("/tmp/studio.claim", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if(fd >= 0){ write(fd, b, n); close(fd); }
+}
+/* 读登记簿, 判断候选层上那块缓冲是不是我们上次留下的 */
+static int claim_is_ours(int gfidx, u32 addr){
+    int fd, n, i, k = 0; char b[64]; u32 v[3] = {0,0,0};
+    fd = open("/tmp/studio.claim", O_RDONLY, 0);
+    if(fd < 0) return 0;
+    n = read(fd, b, sizeof b - 1); close(fd);
+    if(n <= 0) return 0;
+    b[n] = 0;
+    for(i = 0; i < n && k < 3; i++){
+        char c = b[i]; int d = -1;
+        if(c >= '0' && c <= '9') d = c - '0';
+        else if(c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        if(d >= 0) v[k] = (v[k] << 4) | (u32)d;
+        else if(i && ((b[i-1] >= '0' && b[i-1] <= '9') || (b[i-1] >= 'a' && b[i-1] <= 'f'))) k++;
+    }
+    if((int)v[0] != gfidx) return 0;
+    return (addr && (addr == v[1] || addr == v[2]));
+}
+
 static void fp_learn_bank(int bank){
     u32 fmt=0, sz=0;
     if(bank < 0 || bank > 1) return;
     if(!read_layer_fp(&fmt, &sz)) return;
     if(fmt != g_fp_fmt) return;                    /* 格式都变了, 那不是我们的, 不学 */
     if(g_fp_sz_bank[bank] != sz){
+        volatile u32 *r;
         g_fp_sz_bank[bank] = sz;
         plat_log("[让出协议] 学到 bank"); p_logd(bank);
         plat_log(" 指纹 sz="); p_logh(sz); plat_log("\n");
+        /* 刚推完那一帧读到的地址, 按定义就是我们自己的 -> 登记 */
+        r = rec_of_hw(g_hwidx);
+        if(r && r[5] != g_claim_a[bank]){ g_claim_a[bank] = r[5]; claim_write(); }
     }
 }
 static int fp_is_ours(u32 sz){
@@ -432,7 +492,15 @@ u16_ *plat_framebuf(void){ return g_fb; }
  *   (只调一次 set_blending 就出横向条纹, 就是这么发现的)
  *   ⇒ 凡调 set_surfaces, 后面 blending / 两个 viewport / 层序 **全都要重申**。
  *   固定序列: set_surfaces -> set_blending -> src_vp -> dst_vp -> order -> enable -> update */
-static unsigned char g_alphablk[64];    /* 全零 gf_alpha_t: mode=0, 在驱动 9 值白名单内 */
+/* 🔒 **唯一允许传给 gf_layer_set_blending 的东西**, 而且是 const ⇒ 落在 .rodata。
+ * 为什么非要 const: 2026-08-11 真车 PDC 变黑的根因是 gdcServerCarmine 的 alpha 平面池
+ * **发出去永远收不回**(分配写 8..11, 释放守卫要求 ≤3, 值域不相交 ⇒ 释放代码不可达)。
+ * 只有**非零** gf_alpha_t 才会走到分配器 —— 全零在第一道门 `cmp/eq #1` 就被拨到释放分支。
+ * 原来这里是个可写的 unsigned char[64] + 两个手写清零循环 + 一句注释, 也就是说
+ * "它永远是零"只是**纪律**: 谁不小心 memset/memcpy 到附近、或者新加一处传自己拼的结构体,
+ * 都编得过、也刷得上, 而代价是车主的倒车雷达。const 之后这条不变式由链接器保证。
+ * ⚠️ 别改回可写数组 —— studio/tools/build.sh 的 lint 会当场拦下。 */
+static const unsigned char g_alpha_zero[64] = { 0 };
 /* 🐛🐛 2026-08-13 定案的抖动真因就在这个函数里。
  *   `g_front` 声明处的注释写着"周期重申要用它, **不能写死第一块**" —— 但代码从来没读过 g_front,
  *   `set_surfaces` 一直传 `&g_surf`(= bank0)。而本函数**每秒被 plat_present 尾部调用一次,
@@ -461,17 +529,42 @@ static int g_cover, g_shown, g_push_ok;
 /* 返回 1 = 真的点亮了; 0 = 被闸门拦下(或者层还没建好)。
  * **有返回值是为了能自检** —— 没有它, "闸门还在不在"只能靠读代码, 而那正是这条
  * 不变式最容易被以后某次改动悄悄拆掉的方式。 */
+/* 🔒 **关层的唯一出口**, 和 push_layer 对称。
+ * 2026-08-15 审计发现: 三处 gf_layer_disable(让开 / 进镜像 / 退出)一个都没查 g_yield。
+ * 让出态的定义是"原厂正在用这层, 我们纯停手" —— 这时候 disable 就是**把原厂的画面关掉**,
+ * 而 911 上这层可能正在画倒车雷达。让出协议存在的全部意义就是不碰它。
+ * ⚠️ 别在这儿"顺手还原层序": 还原也是写, 让出期间一个字都不许写。 */
+static void layer_release(const char *why){
+    if(!g_layer){ g_shown = 0; return; }
+    if(g_yield){
+        plat_log("[让出] 停手期间不 disable, 层归原厂 ("); plat_log(why); plat_log(")\n");
+        g_shown = 0; return;
+    }
+    gf_layer_disable(g_layer);   /*DISABLE-OK*/
+    gf_layer_update(g_layer, 0);
+    g_shown = 0;
+}
+
 static int push_layer(void){
     gf_surface_t cur;
     if(!g_layer || !g_surf) return 0;
-    if(g_cover && !g_shown && !g_push_ok){
+    /* 🔒 让出态: 层归原厂, **一个字都不写**。
+     * 2026-08-15 审计: 500ms 兜底强推(plat_tick_watch)原来没有这个判断, 而**九行之下**
+     * 那个补换页的兄弟块有 —— 靠每个调用方各记一次, 已经漏了一次。
+     * 和防绿屏闸门同一条道理: 放在唯一出口上, 谁都绕不过去。
+     * ⚠️ g_push_ok **不能**绕过这一条 —— 它只是"帧没就位也要亮"的逃生门,
+     *   不是"抢原厂的层"的逃生门。 */
+    if(g_yield){ return 0; }
+    if(!g_shown && !g_push_ok){
+        /* 注意这里**没有** g_cover —— "首帧没就位就不许亮"和想不想盖屏无关。
+         * 原来写的是 `g_cover && !g_shown`, 于是 g_cover=0 时反而畅通无阻。 */
         plat_log("[层] 首帧还没就位, 拒绝点亮(防绿屏)\n");
         return 0;
     }
     cur = (g_front && !g_oldfront) ? g_front : g_surf;
     if(g_front && cur != g_front) g_reassert_flip++;
     gf_layer_set_surfaces(g_layer, &cur, 1);
-    gf_layer_set_blending(g_layer, (gf_alpha_t*)g_alphablk);
+    gf_layer_set_blending(g_layer, (gf_alpha_t*)(void*)g_alpha_zero);
     gf_layer_set_src_viewport(g_layer, 0, 0, SCR_W-1, SCR_H-1);
     /* ⚠️ 宽高**都是** x2-x1+1。旧注释"高 = y2-y1 无 +1"是错的 ——
      *   2026-08-04 隔壁用 pcmshot 差分实测: 传 y2=y+h 会多渲染一行。整屏时更糟:
@@ -583,7 +676,16 @@ int plat_init(void){
     static unsigned char devinfo[256], dispinfo[256], sinfo[96];
     gf_display_info_t *di;
     gf_surface_info_t *si;
-    int pref[3] = {1,5,7};            /* gf1(硬件L6)=唯一空闲RGB层, 首选; gf5/gf7 兜底。**绝不用 gf6**(视频采集层, 红色死) */
+    /* 🚨 2026-08-17 用户拍板: **只留 gf1, 删掉 gf5/gf7 两个兜底。**
+     *   gf1(硬件L6)是 KB 里查清楚过的、真正空闲的那块 RGB 层。
+     *   而 **gf5 是原厂切换页面用的过渡层**(见 memory overlay-root-cause-CRACKED-bench-repro-2026-08-04),
+     *   gf7=硬件L0 旧引擎直接列进了永不选的黑名单。
+     * 为什么兜底反而危险: 占用闸门看的是"**此刻**这层有没有人在扫", 它看不出
+     *   "过一会儿原厂要用"。08-17 台架上就真落到 gf5 上跑起来了 —— 那一刻它确实是空的,
+     *   但原厂一翻页就会回来要。**抢原厂的过渡层, 正是我们花一整天在防的那类事故。**
+     * ⇒ 抢不到 gf1 就干脆不显示。少一层兜底, 换掉一整类"看起来能用、其实在抢"的风险。
+     * ⚠️ **绝不用 gf6**(硬件L1 视频采集层, 高6位死 = 红色出不来)。 */
+    int pref[1] = {1};
 
     g_t0 = p_now_raw();
     plat_log("=== PCM Studio (真机后端) ===\n");
@@ -610,24 +712,73 @@ int plat_init(void){
     plat_log("display "); p_logd((int)di->xres); plat_log("x"); p_logd((int)di->yres);
     plat_log("  nlayers="); p_logd((int)di->nlayers); plat_log("\n");
 
-    /* 3. 抢池外空闲层(5 优先) */
-    for(ci=0; ci<3; ci++){
-        int c = pref[ci];
+    /* 3. 抢池外空闲层(gf1 优先)
+     * 🚨 2026-08-15 加的**占用闸门** —— 原来这里 attach 到谁就用谁, 一次检查都没有。
+     *   判据照抄旧引擎 coexist_pop.c:759(它在真车上跑过): 记录里是 **800×480 且有真缓冲**
+     *   ⇒ 这层原厂正在扫, **跳过**。`0x00100000` 是"没有缓冲"的哨兵值。
+     *   为什么必须有: 层分布随车型而变, 而抢一个原厂正在用的层 = 把它的画面换成我们的,
+     *   911 上那可能就是倒车雷达。旧引擎有这道门, studio 一直没有。
+     * ⚠️ 代价说清楚: 我们自己**也是** 800×480, 所以上一次崩掉留下的残留会被判成"有人在用"
+     *   而跳过 —— 那一版画面会留在屏上直到断电。这是故意的取舍:
+     *   分不清"原厂在用"和"我们的尸体"时, 宁可少抢一层, 也不能在车上抹掉原厂的画面。
+     *   (正常停法 `touch /tmp/studio.stop` 会干净归还, 根本走不到这里。) */
+    for(ci=0; ci<(int)(sizeof pref / sizeof pref[0]); ci++){
+        int c = pref[ci], hw = 7 - c;
+        volatile u32 *rec;
         if(di->nlayers && c >= (int)di->nlayers) continue;
+        rec = rec_of_hw(hw);
+        if(rec){
+            plat_log("[选层] gf"); p_logd(c); plat_log("(硬件L"); p_logd(hw);
+            plat_log(") w="); p_logd((int)rec[3]); plat_log(" h="); p_logd((int)rec[4]);
+            plat_log(" addr="); p_logh(rec[5]); plat_log("\n");
+            if(rec[3] == (u32)SCR_W && rec[4] == (u32)SCR_H &&
+               (rec[5] & 0x0fffffffu) != 0x00100000u){
+                /* 有真缓冲 —— 但可能是**我们上次自己留下的**。登记簿说了算。 */
+                if(claim_is_ours(c, rec[5])){
+                    plat_log("[选层] gf"); p_logd(c);
+                    plat_log(" 上面那块缓冲在认领登记簿里 = 我们自己的残留 -> 接管\n");
+                } else {
+                    plat_log("[选层] gf"); p_logd(c);
+                    plat_log(" 是 800x480 且有真缓冲 = 有人在扫 -> 跳过, 不碰\n");
+                    continue;
+                }
+            }
+        } else {
+            /* 读不到记录 = 没有占用判据。别硬上 —— 见下面让出保护那段同样的道理。 */
+            plat_log("[选层] ⚠ gf"); p_logd(c); plat_log(" 读不到层记录, 无法判占用 -> 跳过\n");
+            continue;
+        }
         r = gf_layer_attach(&g_layer, g_disp, c, GF_LAYER_ATTACH_PASSIVE);
         plat_log("gf_layer_attach("); p_logd(c); plat_log(",PASSIVE) r="); p_logd(r); plat_log("\n");
         if(r == GF_ERR_OK){ g_lidx = c; break; }
         g_layer = 0;
     }
-    if(!g_layer){ plat_log("ABORT 没抢到层\n"); return -1; }
+    if(!g_layer){ plat_log("ABORT gf1 被占用或读不到记录 -> 不显示(唯一候选, 不再退到 gf5/gf7)\n"); return -1; }
 
-    /* 🚨 接管前先把这层**真关一次** —— 清掉上一个实例(崩溃/被杀/看门狗退出)留下的残留。
-     *   gdc 不会在客户端死亡时关层, 新实例 attach 上来硬件侧还挂着旧配置。
-     *   ⚠️ 此刻还没建 surface, 所以只 disable+update, **不碰几何**(在无 surface 的层上设视口
-     *      是没人验证过的路径, 还会给"层塌成 1×1"多备一个来源)。 */
-    gf_layer_disable(g_layer);
+    /* 🚑 **安全网在这儿装, 而且只依赖"层已经到手"这一件事。**
+     *   从这一行往后, 任何一种死法(段错误/被 kill/挂死)都会走到 ts_panic_restore,
+     *   它摘触摸门(如果装着)并把层还回去。安装条件绝不能挂在别的功能上 ——
+     *   原来它在 plat_ts_arm 末尾, 触摸门装不上就等于**整个进程没有安全网**。
+     *   挂死不产生任何信号, 而本项目最有前科的死法就是挂死(gf_layer_update 会
+     *   REPLY-block 锁死整个进程, 08-05 踩过) ⇒ 还有一道 alarm(3) 看门狗, 主循环每拍续命。 */
+    install_panic_net();
+
+    /* 🚨🚨 **必须先复位混合, 再 disable+update。** 顺序不是随手写的:
+     *   服务端的提交函数(0x0804d634)会走**该层所有脏位**, 包括 blend 那一位, 而且它
+     *   不关心是谁置的 —— 层配置按硬件层存、不归还。若上一个占用者调过非零的
+     *   set_blending、还没自己 update 就死了, 那个脏位和它的非零配置还挂在那儿,
+     *   **我们这次 update 就会替它提交**, 于是从池里分配走一块 alpha 平面 ——
+     *   而释放代码在固件里不可达(2026-08-11 反汇编结论), 一发出去到断电都收不回,
+     *   PDC 拿不到平面就是纯黑。这正是真车那次事故的机制。
+     *   ⇒ 先塞一次全零的 set_blending, 让我们触发的第一次提交必然带着我们的零。
+     *   set_blending 不需要 surface, 所以放在这儿不违反下面"不碰几何"那条。 */
+    gf_layer_set_blending(g_layer, (gf_alpha_t*)(void*)g_alpha_zero);
+    /* 接管前把这层**真关一次** —— 清掉上一个实例留下的残留。
+     * ⚠️ 此刻还没建 surface, 所以只 disable+update, **不碰几何**(在无 surface 的层上设视口
+     *    是没人验证过的路径, 还会给"层塌成 1×1"多备一个来源)。 */
+    gf_layer_disable(g_layer);   /*DISABLE-OK*/
     gf_layer_update(g_layer, 0);
-    plat_log("[清残留] 已 disable+update 真关一次\n");
+    plat_log("[清残留] 已复位混合 + disable+update 真关一次\n");
 
     /* 4. 建整屏 surface。格式常量传 0x1710(它只决定 bpp=2, 硬件模式由驱动写死 RGBA5551) */
     r = gf_surface_create_layer(&g_surf, &g_layer, 1, 0, SCR_W, SCR_H, GF_FORMAT_PACK_ARGB1555, (void*)0, 0);
@@ -657,7 +808,6 @@ int plat_init(void){
       while(w<8){ g_order[w]=(unsigned)w; w++; }
       g_norder = 8; }
     g_hwidx = 7 - g_lidx;   /* 硬件层号 = 7 - gf层号(驱动三处 neg/add#7 反转) */
-    { int i; for(i=0;i<64;i++) g_alphablk[i] = 0; }   /* mode=0 = 不混合; 不靠 BSS 清零 */
     g_force_full = 2; g_bench_done = 0;
     { int f = open("/tmp/studio_oldfront", O_RDONLY, 0);
       if(f >= 0){ close(f); g_oldfront = 1;
@@ -709,11 +859,46 @@ int plat_init(void){
         else             plat_log("[自检] 防绿屏闸门有效 ✓(接管时先写帧再点亮)\n");
         g_shown = keep;
     }
+    /* ============ 开机自检 2: 让出闸门还活着吗(2026-08-15 加) ============
+     * 让出协议是**真车安全件** —— 911 上这层可能正在画倒车雷达, 抢它就是把雷达换成我们的页面。
+     * 而 2026-08-15 审计发现 500ms 兜底强推**根本没查 g_yield**, 而九行之下那个兄弟块查了:
+     * 靠每个调用方各记一次, 已经漏了一次。现在闸门挪进 push_layer 这个唯一出口, 并在这里验它。
+     * 同样零风险: 只在这一拍把 g_yield 临时置 1, 立刻还原, 不碰任何硬件状态。 */
+    {   int keep = g_yield;
+        g_yield = 1;
+        if(push_layer()) plat_log("‼️ [自检] 让出闸门失效: 让出态下竟然还写了层\n");
+        else             plat_log("[自检] 让出闸门有效 ✓(原厂用这层时我们纯停手)\n");
+        g_yield = keep;
+    }
     g_last_reassert = plat_now_ms();
     if(read_layer_fp(&g_fp_fmt, &g_fp_sz)){
+        volatile u32 *r0;
         plat_log("[让出协议] 已就绪 hw L"); p_logd(g_hwidx);
         plat_log(" 指纹 fmt="); p_logh(g_fp_fmt); plat_log(" sz="); p_logh(g_fp_sz); plat_log("\n");
-    } else plat_log("[让出协议] ⚠ 读不到层记录, 让出保护不可用\n");
+        /* 📒 **首推之后立刻登记 —— 别等第一次绘制。**
+         * 2026-08-17 台架实测的洞: 登记簿原来只挂在 `fp_learn_bank`(要真绘制过才跑),
+         * 可是**首推已经把我们的地址写进层记录了**。⇒ 一个"起来了但从没接管过"的实例
+         * 退出后, 层上留着地址、登记簿却是空的 ⇒ 下次启动被自己的闸门拒之门外。
+         * 这一刻读到的地址按定义就是我们刚推上去的那块, 是最早能登记的时机。 */
+        r0 = rec_of_hw(g_hwidx);
+        if(r0 && r0[5]){ g_claim_a[0] = r0[5]; claim_write();
+            plat_log("[认领] 已登记 gf"); p_logd(g_lidx);
+            plat_log(" bank0 addr="); p_logh(g_claim_a[0]); plat_log("\n"); }
+    } else {
+        /* 🚨 2026-08-15: 原来这里只打一行警告就 `return 0` —— 让出保护**fail-open**。
+         *   读不到层记录 ⇒ g_yield 永远是 0 ⇒ "原厂开始用这层"这件事我们永远发现不了,
+         *   而这正是真车上最危险的那个场景。没有判据的时候正确做法是不抢, 不是照抢。 */
+        plat_log("‼️ [让出协议] 读不到层记录 -> 没有占用判据 -> 拒绝启动(fail-closed)\n");
+        return -1;
+    }
+    /* 🚨 启动时我们还没决定要不要接管(g_cover 初值 0)。上面那次首推是为了
+     *   ① 把层配置立起来 ② 让指纹基线量到的是**我们自己**的配置。
+     *   但它同时把层点亮了, 而此刻 surface 里是什么没人保证 ⇒ 立刻关掉。
+     *   真正的点亮交给 swap_bank(先写帧再点亮)。 */
+    if(!g_cover){
+        layer_release("启动: 还没决定接管");
+        plat_log("[覆盖] 启动默认不盖屏, 等原厂页 id 锚上再决定\n");
+    }
     return 0;
 }
 
@@ -724,6 +909,7 @@ int plat_init(void){
 void plat_puppet_park(void);     /* 见文件后半"傀儡事件协议": 退出时把 LEVEL 归零 */
 /* 事件订阅: 0=没订上(退回纯轮询) 1=订上了。定义在文件靠后, 这里前向声明。 */
 static int g_ev_on;
+void install_panic_net(void);    /* 崩溃安全网, 定义在文件靠后的触摸门那一节 */
 static int  mme_reg_events(int on);
 static void mme_drain_events(void);
 
@@ -731,16 +917,24 @@ void plat_shutdown(void){
     /* 🚨🚨 **第一件事就是摘触摸门**, 而且必须在下面 `if(!g_layer) return` 之前。
      *   `touch /tmp/studio.stop` 是文档里唯一推荐的停法, 它走这里、**一个信号都不产生** ——
      *   漏了这一句, 正常停一次 studio 就把原厂触摸永久留死。这比崩溃的概率高一个数量级。 */
+    alarm(0);                    /* 退出流程可能慢(归还层 + 注销事件), 别被自己的看门狗打断 */
     plat_ts_disarm();
     /* 显式注销事件。close(fd)/进程死时服务端也会 ntfy_freeClient 回收(逐指令查过),
      * 但正常退出走这条更干净 —— 双保险。同样必须在 `if(!g_layer) return` 之前。 */
     if(g_ev_on) mme_reg_events(0);
     plat_puppet_park();          /* studio 走了就别留着武装态 —— LEVEL=0 = cave 惰性 */
     if(g_layer){
-        { int i; for(i=0;i<64;i++) g_alphablk[i]=0; }
-        gf_layer_set_blending(g_layer,(gf_alpha_t*)g_alphablk);  /* 别把混合绑定留给下一个人 */
-        gf_layer_disable(g_layer);
-        gf_layer_update(g_layer, 0);                             /* 只有 disable+update 才真关 */
+        gf_layer_set_blending(g_layer,(gf_alpha_t*)(void*)g_alpha_zero);  /* 别把混合绑定留给下一个人 */
+        layer_release("退出");                                   /* 只有 disable+update 才真关 */
+        /* 层已经关掉了, 顺手把显示级层序还原成恒等 —— 我们把自己排到过最顶,
+         * 那是个 display 全局数组, 没人替我们收拾。关着的层排在哪儿都不画,
+         * 所以这一步是纵深防御而不是治病。⚠️ 让出态下 layer_release 不会真关,
+         * 那时也**不该**动层序, 所以这句跟着 g_yield 一起跳过。 */
+        if(!g_yield){
+            int k; unsigned ident[8];
+            for(k=0;k<8;k++) ident[k]=(unsigned)k;
+            gf_display_set_layer_order(g_disp, ident, 0);
+        }
         plat_log("[退出] 已复位混合 + disable+update 真归还层\n");
     }
     /* 🔒 锁**最后**才放, 而且 g_layer==0(init 半路失败)这条路也必须放到 ——
@@ -812,7 +1006,13 @@ void plat_post_cmd(void);
  * 这条路镜像模式已经验证过。⚠️ 只"不画"不够, 层还开着会一直扫我们上一帧。
  *
  * 🚨 绝不 disable 原厂的层, 只关我们自己这一块(gf1)。 */
-static int g_cover = 1;                  /* 1 = 我们盖着; 0 = 让给原厂(声明在 push_layer 之前) */
+/* 🚨 2026-08-15 把初值从 1 改成 0。
+ * 原来进程一起来就是"盖着", 而**交还屏幕的唯一路径**是 main_pcm 的页路由, 它要求
+ * `stock_page >= 0` —— 也就是说必须先锚上 PCM3Reload 才可能让开。开机自启时我们跑在
+ * 原厂图形栈之前, 锚不上是常态; 一旦一直锚不上, 就是**整个点火周期整屏盖着原厂,
+ * 包括用户倒车的时候**。默认"不盖"是唯一安全的初值: 锚上了再由路由打开。
+ * (台架手动流程不受影响 —— /tmp/studio_scene 那条路自己会 set_cover(1)。) */
+static int g_cover = 0;                  /* 1 = 我们盖着; 0 = 让给原厂(声明在 push_layer 之前) */
 /* 层现在是不是**真的亮着并且显示的是我们的内容**。
  * 和 g_cover 分开是故意的: g_cover 是"我们想不想显示", g_shown 是"显示出来了没有"。
  * 接管的那一刻两者会有一段不相等 —— 那正是"先写帧再点亮"这条修法的全部内容。 */
@@ -870,9 +1070,7 @@ static void set_cover(int on){
             }
         }
     } else {
-        gf_layer_disable(g_layer);
-        gf_layer_update(g_layer, 0);
-        g_shown = 0;                     /* 层关了 = 屏上不是我们 */
+        layer_release("让开");
         g_swap_pending = 0;              /* 让开了就别再补那一帧, 回来时 g_force_full=2 会全画 */
         plat_log("[覆盖] 让开, 显示原厂\n");
     }
@@ -882,6 +1080,16 @@ int plat_is_covering(void){ return g_cover; }
 static void swap_bank(void);   /* 定义在下面; tick_watch 要用它补被节流吞掉的换页 */
 void plat_tick_watch(void){
     static int last_mode = -1;
+    /* 🐕 **看门狗续命 —— 必须在最前面, 而且不受任何条件门控。**
+     * 🚨 2026-08-17 台架实测的回归(我自己引入的): 审计说安全网不该挂在触摸门上, 于是
+     *   `alarm(3)` 挪进了 plat_init 无条件装; 但**唯一续命的地方**是 plat_ts_watch(),
+     *   而它第一行就是 `if(!g_ts_armed) return`。⇒ 触摸门没装上时看门狗永不续命,
+     *   **3 秒后 SIGALRM 打死自己**, 而处理器里是 exit(3) 不打日志 ⇒ **死得静悄悄**,
+     *   日志停在半句话上。这次是 g_cover 默认 0 不装门, 一跑就死。
+     * ⇒ 装看门狗和续看门狗必须在**同一个条件下**(这里是"无条件")。
+     *   plat_tick_watch 由主循环每拍无条件调用, 是唯一合适的地方。
+     *   ⚠️ 放在 `if(!g_vaddr) return` **之前** —— init 半路失败时更需要它。 */
+    alarm(WATCHDOG_SEC);
     if(!g_vaddr) return;
     /* 🔒 **不变式维护: 盖着 ⇒ 触摸门装着。**
      * 🚨 2026-08-14 实测教训: 原来只把装门写在 set_cover(1) 的转换里, 而 `g_cover` 的
@@ -917,8 +1125,7 @@ void plat_tick_watch(void){
      *   ⇒ 现在: 进镜像一律关层; 退镜像**只在 g_cover 时**才重新推。
      *     set_cover 自己那边也加了同样的判断(镜像期间只记状态)。 */
     if(g_mode == 2 && last_mode != 2){
-        gf_layer_disable(g_layer); gf_layer_update(g_layer, 0);
-        g_shown = 0;
+        layer_release("进镜像模式");
         plat_log("[镜像模式] 已让出屏幕, 原厂界面可见; 只读状态并打日志\n");
     } else if(g_mode != 2 && last_mode == 2){
         if(g_cover){
@@ -1059,7 +1266,7 @@ static void swap_bank(void){
     g_last_swap = now;
     gf_layer_set_surfaces(g_layer, &cur, 1);
     /* set_surfaces 会冲掉其它绑定, 全部重申(这条是 08-05 实证的铁律) */
-    gf_layer_set_blending(g_layer, (gf_alpha_t*)g_alphablk);
+    gf_layer_set_blending(g_layer, (gf_alpha_t*)(void*)g_alpha_zero);
     gf_layer_set_src_viewport(g_layer, 0, 0, SCR_W-1, SCR_H-1);
     gf_layer_set_dst_viewport(g_layer, 0, 0, SCR_W-1, SCR_H-1);
     gf_display_set_layer_order(g_disp, g_order, 0);
@@ -1363,7 +1570,7 @@ static void locate_menumgr(void){
             if(le32(g_scan+j+12)!= MM_HMI)   continue;
             { u32 X = va + (u32)j;
               if(X < MM_LO) continue;
-              if(!g_mm) g_mm = X;
+              if(!g_mm){ g_mm = X; g_mm_fail = 0; }   /* 锚上了就把失败预算还回去 */
               hits++; }
         }
     }
@@ -2272,7 +2479,21 @@ static int ts_resolve(void){
 /* 🚨 handler 里**先校验 vptr 再写**。SIGSEGV 本身就意味着状态可能已经烂了;
  *   若 S 已被释放/复用, 盲写就从"触摸没了"升级成"把原厂 HMI 写崩"。
  *   read/write/lseek 都是 async-signal-safe, 成本一次 syscall, 值。 */
+/* 兜底的兜底: 归还图层那两步万一 REPLY-block 住, 2 秒后强杀自己。
+ * ⚠️ 这里想用 `_exit`, 但 SH4 那套 SONAME 桩里没有它(链接期 undefined reference)。
+ *   用 `exit` 在本进程是等价的: 全仓没有任何 atexit 钩子(2026-08-15 审计逐条查过),
+ *   而日志走的是裸 write 不是 stdio, 没有缓冲要冲。 */
+static void panic_hard_exit(int sig){ (void)sig; exit(3); }
+
 static void ts_panic_restore(int sig){
+    /* 🚨🚨 **第一件事是留下死因。** 2026-08-17 台架上被这个坑了一次:
+     *   进程被 SIGALRM 打死, 而这里直接 exit(3) 一个字不写 ⇒ 日志停在半句话上,
+     *   现象是"studio 悄无声息地没了"。**静默的死比死本身贵得多** ——
+     *   我先怀疑了崩溃、怀疑了层冲突, 最后才想到看门狗。一行日志能省掉这一整轮。
+     * 安全性: plat_log 走裸 open/write/close, 都是 async-signal-safe 的, 没有 stdio 缓冲。 */
+    { char b[2]; b[0] = (char)('0' + (sig % 10)); b[1] = 0;
+      plat_log("‼️ [安全网] 收到信号 "); plat_log(b);
+      plat_log("(个位) -> 摘门 + 归还图层 + 退出。SIGALRM=14 就是看门狗超时\n"); }
     if(g_ts_armed && g_ts_S && g_rl_w >= 0){
         u32 vp = 0, z = g_ts_orig;
         if(lseek(g_rl_w, (long)g_ts_S, 0) == (long)g_ts_S &&
@@ -2280,8 +2501,39 @@ static void ts_panic_restore(int sig){
            lseek(g_rl_w, (long)(g_ts_S + TSS_GATE), 0) == (long)(g_ts_S + TSS_GATE))
             write(g_rl_w, &z, 4);
     }
+    /* 🚑 2026-08-15 加: **崩溃时也把层还回去**。
+     *   原来这里只写回触摸门那个字就 exit —— 而 gf_layer_detach 是零 IPC 空操作,
+     *   进程死了硬件 enable 位还是 1 ⇒ 我们最后一帧**永久冻在屏上**, 原厂再也盖不回来。
+     *   这在车上意味着一块死画面挡着原厂界面, 只能靠断电。
+     * ⚠️ 风险摆明: gf_layer_update 会 REPLY-block(08-05 踩过), 而 handler 可能正是
+     *   因为 gf 卡住才跑起来的。所以先装一个只做 _exit 的 SIGALRM + alarm(2) 兜底 ——
+     *   还得回来就干净退出, 卡住就 2 秒后强杀。两种结局都不比"什么都不做"差。
+     * ⚠️ 让出态不还 —— 那时候层是原厂的, 关它就是抹掉原厂的画面。 */
+    if(g_layer && !g_yield){
+        signal(SIGALRM, panic_hard_exit);
+        alarm(PANIC_EXIT_SEC);
+        gf_layer_disable(g_layer);   /*DISABLE-OK*/
+        gf_layer_update(g_layer, 0);
+        alarm(0);
+    }
     (void)sig; exit(3);
 }
+/* 一次性安装崩溃安全网。幂等, 重复调用无害。 */
+void install_panic_net(void){
+    static int done = 0;
+    if(done) return;
+    done = 1;
+    signal(SIGSEGV, ts_panic_restore); signal(SIGBUS,  ts_panic_restore);
+    signal(SIGILL,  ts_panic_restore); signal(SIGFPE,  ts_panic_restore);
+    signal(SIGTERM, ts_panic_restore); signal(SIGINT,  ts_panic_restore);
+    signal(SIGHUP,  ts_panic_restore); signal(SIGQUIT, ts_panic_restore);
+    signal(SIGABRT, ts_panic_restore);
+    signal(SIGALRM, ts_panic_restore); alarm(WATCHDOG_SEC);
+    plat_log("[安全网] 信号处理器 + 看门狗已装(崩溃/被杀/挂死都会摘门并归还图层)\n");
+    /* ⚠️ 别把秒数写死进这句话 —— 它一度写着"3秒"而 WATCHDOG_SEC 已经是 5,
+     *   正是那种"注释/日志和代码各说各话"的腐烂。要显示就从常量打出来。 */
+}
+
 /* 🚨 **不变式专用入口**: 确保门处于 want 指定的状态, 返回**执行后它到底装没装**。
  * 为什么要它(2026-08-14 踩过): plat_ts_arm() 成功返回 **1**、失败返回负数,
  * 而本项目大部分函数是 0=成功 —— 我按 `r == 0` 判成功, 于是门明明装上了却报"装不上",
@@ -2310,16 +2562,12 @@ int plat_ts_arm(void){
         plat_log("[触摸门] ⚠ 回读="); p_logh(back); plat_log(" 不是 1 -> TSX_E_WRITEFAIL\n"); return -7;
     }
     g_ts_armed = 1; g_ts_want = 1; g_ts_armed_pub = 1;
-    signal(SIGSEGV, ts_panic_restore); signal(SIGBUS,  ts_panic_restore);
-    signal(SIGILL,  ts_panic_restore); signal(SIGFPE,  ts_panic_restore);
-    signal(SIGTERM, ts_panic_restore); signal(SIGINT,  ts_panic_restore);
-    signal(SIGHUP,  ts_panic_restore); signal(SIGQUIT, ts_panic_restore);
-    signal(SIGABRT, ts_panic_restore);
-    /* 🚨 挂死**不产生任何信号** —— 而本项目最有前科的死法就是挂死
-     *   (gf_layer_update 会 REPLY-block 把整个进程锁死, 08-05 踩过)。
-     *   所以再加一道 alarm 看门狗: 主循环每拍 alarm(3) 续命, 真卡住 3 秒 -> SIGALRM -> 摘门退出。
-     *   这个模式抄自隔壁 coexist_pop.c, 已在本机验过。 */
-    signal(SIGALRM, ts_panic_restore); alarm(3);
+    /* 🚨 2026-08-15: 信号处理器和看门狗**已经挪到 plat_init**(见 install_panic_net)。
+     *   它们原来装在这儿 —— 也就是上面五个 early return 的后面。
+     *   ⇒ 触摸门只要装不上(链路校验失败 / 原值非 0 / 没锚到 mapper / 没有可写句柄),
+     *     整个进程就**一个信号处理器都没有**, 崩了连层都不还。
+     *   而"触摸门装不上"在台架上是常态(开机那几秒 TSX_E=-2), 车上更没把握。
+     *   安全网的安装条件绝不能是另一个功能能不能用。 */
     plat_log("[触摸门] ✅ 已装 TSX_ARMED  S="); p_logh(g_ts_S);
     plat_log("  原厂 HMI 收不到触摸了(硬键不受影响)\n");
     return 1;
@@ -2338,7 +2586,7 @@ int plat_ts_disarm(void){
         plat_log("[触摸门] 🚨🚨 摘除回读失败 TSX_E_RESTOREFAIL —— 触摸可能还是死的, 断电恢复\n");
         return -8;
     }
-    g_ts_armed = 0; g_ts_armed_pub = 0; alarm(0);   /* 门摘了就撤看门狗 */
+    g_ts_armed = 0; g_ts_armed_pub = 0;   /* 不再 alarm(0): 看门狗已与触摸门解耦 */
     plat_log("[触摸门] ✅ 已摘 TSX_DISARMED, 触摸还给原厂\n");
     return 2;
 }
@@ -2349,7 +2597,7 @@ void plat_ts_watch(void){
     if(!g_ts_armed || !g_ts_S) return;
     if(rl_rd32(g_ts_S, &vp) || vp != TSS_VPTR){        /* 对象没了/被复用 -> 绝不再写 */
         plat_log("[触摸门] 🚨 *S 不再是 CSPHMISettingsProxy -> 放手, 不写\n");
-        g_ts_armed = 0; g_ts_armed_pub = 0; alarm(0); return;
+        g_ts_armed = 0; g_ts_armed_pub = 0;   /* 不再 alarm(0): 看门狗已与触摸门解耦 */ return;
     }
     /* 🚨🚨 2026-08-13 定案的真因就在这里。门的判据是**两个字段**:
      *     0x085D1EAA:  return (*(S+0x1a0)==2) ? *(S+0x9c) : 0     ; 之后取反
@@ -2372,21 +2620,21 @@ void plat_ts_watch(void){
                                         *   取反=放行, 与 0x1a0 是几无关。所以不动 0x1a0, 少碰一个字段。 */
         if(v & 1u){ rl_wr32(g_ts_S + TSS_GATE, g_ts_orig);
                     plat_log("[触摸门] 摘除后发现门还是奇数 -> 再写回一次\n"); }
-        else { g_ts_armed = 0; g_ts_armed_pub = 0; alarm(0); }
+        else { g_ts_armed = 0; g_ts_armed_pub = 0;   /* 不再 alarm(0): 看门狗已与触摸门解耦 */ }
         return;
     }
-    if(v == 1){ alarm(3); return; }                        /* 正常, 顺便续看门狗 */
-    if(v == 0){ rl_wr32(g_ts_S + TSS_GATE, 1); alarm(3); return; }  /* 被服务端刷回, 重写 */
+    if(v == 1){ alarm(WATCHDOG_SEC); return; }                        /* 正常, 顺便续看门狗 */
+    if(v == 0){ rl_wr32(g_ts_S + TSS_GATE, 1); alarm(WATCHDOG_SEC); return; }  /* 被服务端刷回, 重写 */
     /* 🚨 门是 `xor #1`: **奇数 ⇒ 触摸仍然是死的**, 这时候放手不管 = 门开着走人, 最坏结果。
      *   只有偶数才是"原厂放行", 才可以安全放手。 */
     if(v & 1u){
         plat_log("[触摸门] 🚨 读到奇数 "); p_logh(v);
         plat_log(" -> 触摸仍被堵, 继续写回原值\n");
-        rl_wr32(g_ts_S + TSS_GATE, g_ts_orig); alarm(3); return;
+        rl_wr32(g_ts_S + TSS_GATE, g_ts_orig); alarm(WATCHDOG_SEC); return;
     }
     plat_log("[触摸门] 🚨 读到偶数第三值 "); p_logh(v);
     plat_log(" = 原厂自己在用且已放行 -> 放手并撤层\n");
-    g_ts_armed = 0; g_ts_armed_pub = 0; alarm(0); set_cover(0);
+    g_ts_armed = 0; g_ts_armed_pub = 0;   /* 不再 alarm(0): 看门狗已与触摸门解耦 */ set_cover(0);
 }
 
 /* 读 PCM3Reload 的任意地址(plat_peek 读的是 PCM3Root)。echo <hex> > /tmp/studio_peek2 */
@@ -2712,9 +2960,19 @@ void plat_read_state(PcmState *st){
     { int pid_ = read_page_id();
       if(pid_ == 0xFFFE) { /* 换页过渡哨兵, 不是真实页 —— 忽略, 保持上一个稳定值 */ }
       else if(pid_ >= 0) s_page = pid_;
-      else if(g_rl >= 0 && g_mm_fail < 10){        /* 节流重锚, 别每拍扫 16MB */
+      else if(g_rl >= 0){
+          /* 🚨 2026-08-15 改: 原来是 `g_mm_fail < 10` —— 约 11 次 / 30 秒之后**终生不再重锚**。
+           *   那个预算是按"台架已经稳态"配的。开机自启时我们跑在原厂图形栈起来之前,
+           *   PCM3Reload 的堆还在长, 30 秒根本不够; 一旦用完, 页 id 永远是 -1,
+           *   而交还屏幕的唯一条件是 stock_page >= 0 ⇒ **整个点火周期盖着屏幕, 包括倒车时**。
+           * ⇒ 改成永不放弃的长退避: 前 10 次 3 秒一试(台架手感), 之后 30 秒一试(几乎不耗)。
+           *   扫一次 16MB 很贵, 但 30 秒一次的代价远小于"永远盖着屏"。 */
           unsigned now = plat_now_ms();
-          if(now - g_mm_last >= 3000){ g_mm_last = now; g_mm_fail++; locate_menumgr(); }
+          unsigned gap = (g_mm_fail < 10) ? 3000u : 30000u;
+          if(now - g_mm_last >= gap){
+              g_mm_last = now; g_mm_fail++; locate_menumgr();
+              if(g_mm_fail == 10) plat_log("[锚定] 菜单管理器连续10次没锚上 -> 退避到30秒一次(不放弃)\n");
+          }
       } }
     /* 每拍把三个原始值报一次变化 —— 台架标定时靠它把数字和真实页面/音源对上 */
     if(s_page != s_page_last || s_slot != s_slot_last || s_app != s_app_last){

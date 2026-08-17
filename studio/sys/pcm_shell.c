@@ -139,6 +139,19 @@ static void shell_back(void){
 static const PcmScene *shell_current(void){ return g_cur>=0 ? g_scenes[g_cur] : 0; }
 static void shell_invalidate(void){ g_dirty = 1; g_dirty_full = 1; }
 
+/* 🔁 **请路由重判一次。**
+ * 2026-08-17 用户报的 bug: 当前源已经是蓝牙时, 在音源页再点蓝牙卡片**毫无反应**。
+ * 根因: 点卡片只做一件事 —— 发 `CMD_SET_SOURCE`。而"去哪一页"完全由 main_pcm 的页路由
+ * 决定, 它的触发条件是 `原厂页 id 变了`。源本来就是蓝牙 ⇒ 原厂页不变 ⇒ 路由一次都不跑。
+ *
+ * ⚠️ 为什么不让场景直接 `shell_goto("btplay")`:
+ *   路由那里写着"**谁显示只在这一处决定**", 两边各判一次迟早打架, 而且到时候
+ *   "为什么这页是原厂的"会变得没人说得清。所以场景只**请求重判**, 决定权仍在路由 ——
+ *   接管开关、页白名单、让不让屏, 全都还是那一套逻辑说了算, 不会出现绕过开关的后门。 */
+static int g_reroute = 0;
+static void shell_request_reroute(void){ g_reroute = 1; }
+static int  shell_take_reroute(void){ int r = g_reroute; g_reroute = 0; return r; }
+
 /* ---------------- 全局输入(任何场景都生效) ---------------- */
 static int shell_global_key(const PcmEvent *ev){
     /* 🔊 音量是**系统级**的, 不该由某个场景各写一遍 —— 原来只有 btplay 处理,

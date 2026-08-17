@@ -41,6 +41,40 @@ lint_guards(){
        studio/scenes/ studio/sys/ 2>/dev/null | grep -vE ':[[:space:]]*[*/]'; then
     echo "‼️ 上面是**会画到屏上**的中文字面量 —— 加进 studio/sys/pcm_i18n.h 的 I18N_LIST, 用 T(STR_xxx)"; bad=1
   fi
+  # ⑤ gf_layer_set_blending 只许收那个 const 全零块。
+  #    2026-08-11 真车事故: gdcServerCarmine 的 alpha 平面池**发出去永远收不回**
+  #    (分配写 8..11, 释放守卫要求 ≤3, 值域不相交 ⇒ 释放代码不可达), 池被占满
+  #    倒车雷达就纯黑。只有**非零** gf_alpha_t 才会走到分配器。
+  #    所以"传进去的永远是零"是**安全件**, 不能只靠 const 和注释 —— 谁新写一处
+  #    传自己拼的结构体, 编得过也刷得上, 而代价是车主的雷达。
+  #    ⚠️ 只扫**产品路径**(platform/sys/scenes)。studio/tools/probe.c 是台架诊断工具, 有自己的
+  #      缓冲, 不随 studio 上车; 把它算进来只会让这条守卫变吵。
+  if grep -rn 'gf_layer_set_blending(' studio/platform/ studio/sys/ studio/scenes/ 2>/dev/null \
+       | grep -v 'g_alpha_zero' | grep -vE ':[[:space:]]*[*/]'; then
+    echo "‼️ 上面的 gf_layer_set_blending 没传 g_alpha_zero —— 非零 gf_alpha_t 会占走一块永不归还的 alpha 平面(真车 PDC 变黑的机制)"; bad=1
+  fi
+  # ⑥ gf_layer_disable 只许出现在 layer_release() 里。
+  #    2026-08-15 审计: 三处 disable(让开/进镜像/退出)一个都没查 g_yield ——
+  #    让出态下关层就是把**原厂正在显示的东西**关掉。和防绿屏闸门同一条道理:
+  #    放在唯一出口上, 谁都绕不过去; 靠每个调用方各记一次, 已经漏过一次了。
+  #    合法站点只有三个, 每个都必须挂 /*DISABLE-OK*/ 标记:
+  #      layer_release()  —— 唯一出口, 带 g_yield 守卫
+  #      plat_init 清残留 —— 跑在占用闸门之后、任何覆盖状态之前
+  #      ts_panic_restore —— 崩溃兜底, 走的是 alarm(2) 限时那条路
+  #    没标记 = 新加的 = 红。标记是**显式且可 grep** 的, 比"记得查一下 g_yield"可靠。
+  if grep -rn 'gf_layer_disable(' studio/platform/ studio/sys/ studio/scenes/ 2>/dev/null \
+       | grep -v 'DISABLE-OK' | grep -vE ':[[:space:]]*[*/]'; then
+    echo "‼️ 上面的 gf_layer_disable 不在白名单里 —— 让出态下关层会抹掉原厂正在显示的画面。走 layer_release()"; bad=1
+  fi
+  # ⑦ alarm() 不许出现裸数字。
+  #    2026-08-17 台架实测栽过一次: 看门狗**装在** plat_init(无条件), **续在** plat_ts_watch
+  #    (只在触摸门装上时), 两者条件不一致 ⇒ 门没装上就 3 秒后被自己打死, 而处理器里
+  #    exit(3) 不打日志 ⇒ 日志停在半句话上, 查了一轮才想到看门狗。
+  #    同一个常量 + 强制具名, 是让"装"和"续"不可能写成两个数的最省事办法。
+  if grep -rnE 'alarm\([0-9]' studio/platform/ studio/sys/ studio/scenes/ 2>/dev/null \
+       | grep -vE 'alarm\(0\)' | grep -vE ':[[:space:]]*[*/]'; then
+    echo "‼️ 上面的 alarm() 用了裸数字 —— 用 WATCHDOG_SEC / PANIC_EXIT_SEC(alarm(0) 除外)"; bad=1
+  fi
   [ $bad -eq 0 ] || { echo "构建被 lint 拦下"; return 1; }
 }
 
